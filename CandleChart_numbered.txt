@@ -1,0 +1,2394 @@
+﻿     1  "use client";
+     2  
+     3  import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+     4  import {
+     5    createChart,
+     6    CrosshairMode,
+     7    type IChartApi,
+     8    type ISeriesApi,
+     9    type LogicalRange,
+    10    type UTCTimestamp,
+    11  } from "lightweight-charts";
+    12  
+    13  /* =========================
+    14     Types
+    15  ========================= */
+    16  type Candle = {
+    17    time: UTCTimestamp; // seconds
+    18    open: number;
+    19    high: number;
+    20    low: number;
+    21    close: number;
+    22  };
+    23  
+    24  type Line2P = {
+    25    t1: UTCTimestamp;
+    26    p1: number;
+    27    t2: UTCTimestamp;
+    28    p2: number;
+    29  };
+    30  
+    31  type ZoneKind = "OB" | "FVG";
+    32  type ZoneInvalidReason = "break" | "touches" | "fullfill" | "choch";
+    33  
+    34  type Zone = {
+    35    kind: ZoneKind;
+    36    side: "bull" | "bear";
+    37    top: number;
+    38    bottom: number;
+    39  
+    40    startTime: UTCTimestamp;
+    41    endTime?: UTCTimestamp;
+    42  
+    43    active: boolean;
+    44    invalidReason?: ZoneInvalidReason;
+    45  
+    46    touchCount?: number;
+    47  };
+    48  
+    49  type ChannelNoneWhy =
+    50    | "mixed_or_range"
+    51    | "anchor_fail"
+    52    | "residual_sample_lt_5"
+    53    | "insufficient_data"
+    54    | "no_atr";
+    55  
+    56  type TrendNoneWhy =
+    57    | "mixed_or_range"
+    58    | "anchor_fail"
+    59    | "insufficient_data"
+    60    | "no_atr";
+    61  
+    62  type ChannelState = {
+    63    mode: "up" | "down" | "none";
+    64    base?: Line2P; // up: support, down: resistance
+    65    offset?: number; // p95 residual (>0)
+    66    breakCount: number; // consecutive valid breaches (4H)
+    67    anchorStartTime?: UTCTimestamp; // base.t1
+    68    why?: ChannelNoneWhy; // ??mode==="none"?????댁쑀
+    69  };
+    70  
+    71  type TrendlineState = {
+    72    mode: "up" | "down" | "none";
+    73    line?: Line2P;
+    74    breakCount: number;
+    75    anchorStartTime?: UTCTimestamp;
+    76    why?: "mixed_or_range" | "anchor_fail"; // ??異붽?
+    77  };
+    78  
+    79  
+    80  
+    81  type H4Context = {
+    82    channel: ChannelState;
+    83    trend: TrendlineState;
+    84    zones: Zone[];
+    85    last4hTime?: UTCTimestamp;
+    86  };
+    87  
+    88  type Props = { symbol: string; tf: string };
+    89  
+    90  type WsKlineMsg = {
+    91    e: "kline";
+    92    k: {
+    93      t: number; // open time ms
+    94      o: string;
+    95      h: string;
+    96      l: string;
+    97      c: string;
+    98      x: boolean; // closed
+    99    };
+   100  };
+   101  
+   102  type WsAggTradeMsg = {
+   103    e: "aggTrade";
+   104    p: string;
+   105    T: number;
+   106  };
+   107  
+   108  /* =========================
+   109     Global in-memory store (persists across TF changes)
+   110  ========================= */
+   111  const H4_STORE: Map<string, H4Context> = (() => {
+   112    // SSR ?덉쟾?μ튂: ?쒕쾭?먯꽌??洹몃깷 ??Map
+   113    if (typeof window === "undefined") return new Map<string, H4Context>();
+   114  
+   115    // 釉뚮씪?곗?(dev)?먯꽌??window??遺숈뿬??HMR?먮룄 ?좎?
+   116    const w = window as any;
+   117    return w.__H4_STORE ?? (w.__H4_STORE = new Map<string, H4Context>());
+   118  })();
+   119  
+   120  
+   121  function getOrInitH4(symbol: string): H4Context {
+   122    const prev = H4_STORE.get(symbol);
+   123    if (prev) return prev;
+   124    const init: H4Context = {
+   125      channel: { mode: "none", breakCount: 0 },
+   126      trend: { mode: "none", breakCount: 0 },
+   127      zones: [],
+   128      last4hTime: undefined,
+   129    };
+   130    H4_STORE.set(symbol, init);
+   131    return init;
+   132  }
+   133  
+   134  function setH4(symbol: string, ctx: H4Context) {
+   135    H4_STORE.set(symbol, ctx);
+   136  }
+   137  
+   138  /* =========================
+   139     Small utils
+   140  ========================= */
+   141  function clamp(n: number, min: number, max: number) {
+   142    return Math.min(Math.max(n, min), max);
+   143  }
+   144  
+   145  function coordTimeToSec(t: any): UTCTimestamp | null {
+   146    if (typeof t === "number") return Math.floor(t) as UTCTimestamp;
+   147    if (t && typeof t === "object" && "year" in t) {
+   148      const d = new Date(t.year, t.month - 1, t.day);
+   149      return Math.floor(d.getTime() / 1000) as UTCTimestamp;
+   150    }
+   151    return null;
+   152  }
+   153  
+   154  function tfToSeconds(tf: string): number {
+   155    const t = tf.toLowerCase();
+   156    if (t === "3m") return 3 * 60;
+   157    if (t === "5m") return 5 * 60;
+   158    if (t === "15m") return 15 * 60;
+   159    if (t === "30m") return 30 * 60;
+   160    if (t === "1h") return 60 * 60;
+   161    if (t === "2h") return 2 * 60 * 60;
+   162    if (t === "4h") return 4 * 60 * 60;
+   163    return 15 * 60;
+   164  }
+   165  
+   166  const SEC_4H = tfToSeconds("4H");
+   167  function to4hCloseTime(t: UTCTimestamp): UTCTimestamp {
+   168    return (Number(t) + SEC_4H) as UTCTimestamp;
+   169  }
+   170  
+   171  function percentile95Positive(values: number[]): number | null {
+   172    const arr = values.filter((v) => Number.isFinite(v) && v > 0);
+   173    if (arr.length < 5) return null;
+   174    arr.sort((a, b) => a - b);
+   175    const idx = Math.floor((arr.length - 1) * 0.95);
+   176    return arr[idx];
+   177  }
+   178  
+   179  function channelBoundaryPriceAt(ch: ChannelState, t: UTCTimestamp, which: "lower" | "upper") {
+   180    // up: base=lower, upper=base+offset
+   181    // down: base=upper, lower=base-offset
+   182    const baseP = linePriceAt(ch.base!, t);
+   183    if (ch.mode === "up") {
+   184      return which === "lower" ? baseP : baseP + (ch.offset ?? 0);
+   185    }
+   186    // down
+   187    return which === "upper" ? baseP : baseP - (ch.offset ?? 0);
+   188  }
+   189  
+   190  function isNear(value: number, target: number, tol: number) {
+   191    return Math.abs(value - target) <= tol;
+   192  }
+   193  // =====================
+   194  // Debug HUD (CH/TR/Z)
+   195  // =====================
+   196  const DEBUG_HUD = true;
+   197  
+   198  function getH4FromWindow(symbol: string) {
+   199    if (typeof window === "undefined") return null;
+   200    const w = window as any;
+   201    const store = w.__H4_STORE as Map<string, any> | undefined;
+   202    if (!store || typeof store.get !== "function") return null;
+   203    return store.get(symbol) ?? null;
+   204  }
+   205  
+   206  function drawDebugHUD(ctx: CanvasRenderingContext2D, symbol: string) {
+   207    if (!ctx) return;
+   208  
+   209    const h4 = getH4FromWindow(symbol);
+   210    const ch = h4?.channel;
+   211    const tr = h4?.trend;
+   212    const zones = Array.isArray(h4?.zones) ? h4.zones : [];
+   213  
+   214    const zActive = zones.filter((z: any) => !!z?.active).length;
+   215  
+   216    const chWhy = ch?.mode === "none" ? (ch?.why ?? "") : "";
+   217    const trWhy = tr?.mode === "none" ? (tr?.why ?? "") : "";
+   218  
+   219    const lines: string[] = [
+   220      `CH: ${ch?.mode ?? "?"}${chWhy ? ` (${chWhy})` : ""}  off=${Number.isFinite(ch?.offset) ? ch.offset.toFixed(1) : "??}`,
+   221      `TR: ${tr?.mode ?? "?"}${trWhy ? ` (${trWhy})` : ""}`,
+   222      `Z: active ${zActive} / all ${zones.length}`,
+   223    ];
+   224  
+   225    const w = window as any;
+   226    if (w?.__CH_DBG?.stage) lines.push(`__CH_DBG: ${w.__CH_DBG.stage}${w.__CH_DBG.why ? ` (${w.__CH_DBG.why})` : ""}`);
+   227    if (w?.__TR_DBG?.stage) lines.push(`__TR_DBG: ${w.__TR_DBG.stage}${w.__TR_DBG.why ? ` (${w.__TR_DBG.why})` : ""}`);
+   228    if (w?.__Z_DBG?.stage)  lines.push(`__Z_DBG: ${w.__Z_DBG.stage}`);
+   229  
+   230    ctx.save();
+   231    ctx.font = "12px monospace";
+   232    ctx.textBaseline = "top";
+   233  
+   234    const pad = 6;
+   235    const lineH = 14;
+   236    const x = 8, y = 8;
+   237  
+   238    const width = Math.max(...lines.map((l) => ctx.measureText(l).width)) + pad * 2;
+   239    const height = lines.length * lineH + pad * 2;
+   240  
+   241    ctx.globalAlpha = 0.75;
+   242    ctx.fillStyle = "#000";
+   243    ctx.fillRect(x, y, width, height);
+   244  
+   245    ctx.globalAlpha = 1;
+   246    ctx.fillStyle = "#fff";
+   247    lines.forEach((l, i) => ctx.fillText(l, x + pad, y + pad + i * lineH));
+   248  
+   249    ctx.restore();
+   250  }
+   251  
+   252  const CONTEXT_ATR_MULT = 0.25;
+   253  
+   254  function passesContextDistance(
+   255    side: "bull" | "bear",
+   256    midPrice: number,
+   257    t: UTCTimestamp,
+   258  
+   259    atrNow: number,
+   260    channel: ChannelState,
+   261    trend: TrendlineState,
+   262  
+   263    // ??zone ???섎떒(?덉쑝硫?range 湲곗??쇰줈 dist 怨꾩궛)
+   264    zoneTop?: number,
+   265    zoneBottom?: number
+   266  ) {
+   267    const distMax = atrNow * CONTEXT_ATR_MULT;
+   268  
+   269    // ??zone range(?놁쑝硫?midPrice瑜?1??range濡?痍④툒)
+   270    const hasZone =
+   271      Number.isFinite(zoneTop ?? NaN) && Number.isFinite(zoneBottom ?? NaN);
+   272    const lo = hasZone ? Math.min(zoneTop as number, zoneBottom as number) : midPrice;
+   273    const hi = hasZone ? Math.max(zoneTop as number, zoneBottom as number) : midPrice;
+   274  
+   275    // ??ref媛 [lo, hi] ?덉씠硫?dist=0
+   276    const distToRange = (ref: number) => {
+   277      if (ref < lo) return lo - ref;
+   278      if (ref > hi) return ref - hi;
+   279      return 0;
+   280    };
+   281  
+   282    const g: any = window as any;
+   283    if (!g.__CTX) g.__CTX = { calls: 0, pass: 0, fail: 0, reasons: {}, last: null };
+   284    const ctx = g.__CTX;
+   285  
+   286    const mark = (ok: boolean, why: string, detail: any = {}) => {
+   287      const g: any = window as any;
+   288      const ctx = g.__CTX;
+   289      if (!ctx) return;
+   290  
+   291      ctx.calls = (ctx.calls ?? 0) + 1;
+   292      if (ok) ctx.pass = (ctx.pass ?? 0) + 1;
+   293      else ctx.fail = (ctx.fail ?? 0) + 1;
+   294  
+   295      ctx.reasons = ctx.reasons ?? {};
+   296      ctx.reasons[why] = (ctx.reasons[why] ?? 0) + 1;
+   297  
+   298      ctx.last = { ok, why, ...detail };
+   299    };
+   300  
+   301    // 1) 梨꾨꼸 ?덉쑝硫?梨꾨꼸 ?곗꽑 + 諛⑺뼢 ?쇱튂 媛뺤젣
+   302    // ??base留??덉뼱???ъ슜(upper/lower媛 base濡?怨꾩궛?섎룄濡?
+   303    if (channel.mode !== "none" && channel.base) {
+   304      if (channel.mode === "up") {
+   305        if (side !== "bull") {
+   306          mark(false, "ch_dir_mismatch", { side, chMode: channel.mode, distMax, midPrice, lo, hi });
+   307          return false;
+   308        }
+   309        const ref = channelBoundaryPriceAt(channel, t, "lower"); // up 梨꾨꼸 lower = base
+   310        const dist = distToRange(ref);
+   311        const ok = dist <= distMax;
+   312        mark(ok, ok ? "ch_ok_lower" : "ch_too_far", {
+   313          ref, dist, distMax, midPrice, lo, hi, side, chMode: channel.mode
+   314        });
+   315        return ok;
+   316      }
+   317  
+   318      if (channel.mode === "down") {
+   319        if (side !== "bear") {
+   320          mark(false, "ch_dir_mismatch", { side, chMode: channel.mode, distMax, midPrice, lo, hi });
+   321          return false;
+   322        }
+   323        const ref = channelBoundaryPriceAt(channel, t, "upper"); // down 梨꾨꼸 upper = base
+   324        const dist = distToRange(ref);
+   325        const ok = dist <= distMax;
+   326        mark(ok, ok ? "ch_ok_upper" : "ch_too_far", {
+   327          ref, dist, distMax, midPrice, lo, hi, side, chMode: channel.mode
+   328        });
+   329        return ok;
+   330      }
+   331    }
+   332  
+   333      // 2) 梨꾨꼸 NONE?대㈃ 異붿꽭???ъ슜 + 諛⑺뼢 ?쇱튂
+   334    if (trend.mode !== "none" && trend.line) {
+   335      if (trend.mode === "up") {
+   336        if (side !== "bull") {
+   337          mark(false, "tr_dir_mismatch", { side, trMode: trend.mode, distMax, midPrice, lo, hi });
+   338          return false;
+   339        }
+   340        const ref = linePriceAt(trend.line, t);
+   341        const dist = distToRange(ref);
+   342        const ok = dist <= distMax;
+   343        mark(ok, ok ? "tr_ok" : "tr_too_far", { ref, dist, distMax, midPrice, lo, hi, side, trMode: trend.mode });
+   344        return ok;
+   345      }
+   346  
+   347      if (trend.mode === "down") {
+   348        if (side !== "bear") {
+   349          mark(false, "tr_dir_mismatch", { side, trMode: trend.mode, distMax, midPrice, lo, hi });
+   350          return false;
+   351        }
+   352        const ref = linePriceAt(trend.line, t);
+   353        const dist = distToRange(ref);
+   354        const ok = dist <= distMax;
+   355        mark(ok, ok ? "tr_ok" : "tr_too_far", { ref, dist, distMax, midPrice, lo, hi, side, trMode: trend.mode });
+   356        return ok;
+   357      }
+   358    }
+   359  
+   360    // 3) 而⑦뀓?ㅽ듃 ?놁쑝硫??ㅽ뙣
+   361    mark(false, "no_context", { distMax, midPrice, lo, hi });
+   362    return false;
+   363  }
+   364  
+   365  
+   366  
+   367  function linePriceAt(line: Line2P, t: UTCTimestamp) {
+   368    const x1 = Number(line.t1);
+   369    const x2 = Number(line.t2);
+   370    if (x1 === x2) return line.p2;
+   371    const m = (line.p2 - line.p1) / (x2 - x1);
+   372    return line.p1 + m * (Number(t) - x1);
+   373  }
+   374  
+   375  /* =========================
+   376     ATR / Swings
+   377  ========================= */
+   378  function computeATR(candles: Candle[], period = 14): number[] {
+   379    const n = candles.length;
+   380    const atr = new Array<number>(n).fill(NaN);
+   381    if (n === 0) return atr;
+   382  
+   383    const tr = new Array<number>(n).fill(0);
+   384    for (let i = 0; i < n; i++) {
+   385      const high = candles[i].high;
+   386      const low = candles[i].low;
+   387      if (i === 0) {
+   388        tr[i] = high - low;
+   389        continue;
+   390      }
+   391      const prevClose = candles[i - 1].close;
+   392      const v1 = high - low;
+   393      const v2 = Math.abs(high - prevClose);
+   394      const v3 = Math.abs(low - prevClose);
+   395      tr[i] = Math.max(v1, v2, v3);
+   396    }
+   397  
+   398    if (n < period) return atr;
+   399  
+   400    let sum = 0;
+   401    for (let i = 0; i < period; i++) sum += tr[i];
+   402  
+   403    let prevAtr = sum / period;
+   404    atr[period - 1] = prevAtr;
+   405  
+   406    for (let i = period; i < n; i++) {
+   407      prevAtr = (prevAtr * (period - 1) + tr[i]) / period;
+   408      atr[i] = prevAtr;
+   409    }
+   410    return atr;
+   411  }
+   412  
+   413  function findSwingHighsLows(candles: Candle[], pivotLen = 3) {
+   414    const n = candles.length;
+   415    const swingHigh = new Array<boolean>(n).fill(false);
+   416    const swingLow = new Array<boolean>(n).fill(false);
+   417  
+   418    for (let i = pivotLen; i < n - pivotLen; i++) {
+   419      let isHigh = true;
+   420      let isLow = true;
+   421  
+   422      const ph = candles[i].high;
+   423      const pl = candles[i].low;
+   424  
+   425      for (let j = i - pivotLen; j <= i + pivotLen; j++) {
+   426        if (j === i) continue;
+   427        if (candles[j].high >= ph) isHigh = false;
+   428        if (candles[j].low <= pl) isLow = false;
+   429        if (!isHigh && !isLow) break;
+   430      }
+   431  
+   432      if (isHigh) swingHigh[i] = true;
+   433      if (isLow) swingLow[i] = true;
+   434    }
+   435  
+   436    return { swingHigh, swingLow };
+   437  }
+   438  
+   439  type PivotPoint = { idx: number; t: UTCTimestamp; p: number };
+   440  
+   441  /* =========================
+   442     4H Channel + Trendline (spec)
+   443  ========================= */
+   444  const PIVOT_LEN = 3;
+   445  const CHANNEL_LOOKBACK = 300;
+   446  const TREND_LOOKBACK = 600;
+   447  
+   448  const CHANNEL_MIN_SWING_MULT = 0.25;
+   449  const TREND_MIN_SWING_MULT = 0.5;
+   450  
+   451  const BREAK_ATR_MULT = 0.2;
+   452  
+   453  function pickHLPair(pivotLowsAsc: PivotPoint[], atrNow: number, minSwingMult: number) {
+   454    if (pivotLowsAsc.length < 2) return null;
+   455    const L2 = pivotLowsAsc[pivotLowsAsc.length - 1];
+   456    for (let k = pivotLowsAsc.length - 2; k >= 0; k--) {
+   457      const L1 = pivotLowsAsc[k];
+   458      if (!(L2.p > L1.p)) continue; // ?숇쪧 遺덊뿀
+   459      if (L2.p - L1.p < atrNow * minSwingMult) continue;
+   460      return { L1, L2 };
+   461    }
+   462    return null;
+   463  }
+   464  
+   465  function pickLHPair(pivotHighsAsc: PivotPoint[], atrNow: number, minSwingMult: number) {
+   466    if (pivotHighsAsc.length < 2) return null;
+   467    const H2 = pivotHighsAsc[pivotHighsAsc.length - 1];
+   468    for (let k = pivotHighsAsc.length - 2; k >= 0; k--) {
+   469      const H1 = pivotHighsAsc[k];
+   470      if (!(H2.p < H1.p)) continue; // ?숇쪧 遺덊뿀
+   471      if (H1.p - H2.p < atrNow * minSwingMult) continue;
+   472      return { H1, H2 };
+   473    }
+   474    return null;
+   475  }
+   476  
+   477  /**
+   478   * buildChannelFromScratch
+   479   * - 2-b 援ъ“ ?꾪꽣: HH/HL => up留? LH/LL => down留? mixed => none
+   480   * - 2-a residual ?쒕낯: base.t2 ?댄썑 pivot留??ъ슜 (異붿쿇)
+   481   * - residual res>0留?
+   482   * - ?쒕낯 <5硫?NONE
+   483   */
+   484  function buildChannelFromScratch(candles4h: Candle[]): ChannelState {
+   485    (window as any).__CH_DBG = {
+   486      stage: "enter",
+   487      at: Date.now(),
+   488      candles: candles4h.length,
+   489    };
+   490  
+   491    const dbgNone = (
+   492      why: "mixed_or_range" | "anchor_fail" | "residual_sample_lt_5",
+   493      detail = "",
+   494      extra: any = {}
+   495    ): ChannelState => {
+   496      (window as any).__CH_DBG = {
+   497        ...(window as any).__CH_DBG,
+   498        stage: "return_none",
+   499        why,
+   500        detail,
+   501        ...extra,
+   502      };
+   503      return { mode: "none", breakCount: 0, why };
+   504    };
+   505  
+   506    const dbgOk = (st: ChannelState, extra: any = {}): ChannelState => {
+   507      (window as any).__CH_DBG = {
+   508        ...(window as any).__CH_DBG,
+   509        stage: "return_ok",
+   510        mode: st.mode,
+   511        offset: st.offset ?? null,
+   512        anchorStartTime: st.anchorStartTime ?? null,
+   513        ...extra,
+   514      };
+   515      return st;
+   516    };
+   517  
+   518     const none = (
+   519      why: "mixed_or_range" | "anchor_fail" | "residual_sample_lt_5",
+   520      detail = "",
+   521      extra: any = {}
+   522    ) => dbgNone(why, detail, extra);
+   523  
+   524  
+   525  
+   526    if (candles4h.length < CHANNEL_LOOKBACK + PIVOT_LEN * 2 + 20) {
+   527      return none("anchor_fail");
+   528    }
+   529  
+   530    const atr = computeATR(candles4h, 14);
+   531    const atrNow = Number.isFinite(atr.at(-1) ?? NaN) ? (atr.at(-1) as number) : NaN;
+   532    if (!Number.isFinite(atrNow) || atrNow <= 0) return none("anchor_fail");
+   533  
+   534    const startIdx = Math.max(0, candles4h.length - CHANNEL_LOOKBACK);
+   535    const slice = candles4h.slice(startIdx);
+   536    const { swingHigh, swingLow } = findSwingHighsLows(slice, PIVOT_LEN);
+   537  
+   538    const pivotHighs: PivotPoint[] = [];
+   539    const pivotLows: PivotPoint[] = [];
+   540    for (let i = 0; i < slice.length; i++) {
+   541      if (swingHigh[i]) pivotHighs.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].high });
+   542      if (swingLow[i]) pivotLows.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].low });
+   543    }
+   544  
+   545    // 2-b) 援ъ“ ?꾪꽣
+   546    if (pivotHighs.length < 2 || pivotLows.length < 2) {
+   547      return none("anchor_fail");
+   548    }
+   549  
+   550    const hPrev = pivotHighs[pivotHighs.length - 2].p;
+   551    const hLast = pivotHighs[pivotHighs.length - 1].p;
+   552    const lPrev = pivotLows[pivotLows.length - 2].p;
+   553    const lLast = pivotLows[pivotLows.length - 1].p;
+   554  
+   555    const isUp = hLast > hPrev && lLast > lPrev;
+   556    const isDown = hLast < hPrev && lLast < lPrev;
+   557  
+   558    if (!isUp && !isDown) {
+   559      return none("mixed_or_range");
+   560    }
+   561  
+   562    // UP 梨꾨꼸
+   563    if (isUp) {
+   564      const upPair = pickHLPair(pivotLows, atrNow, CHANNEL_MIN_SWING_MULT);
+   565      if (!upPair) return none("anchor_fail");
+   566  
+   567      const base: Line2P = { t1: upPair.L1.t, p1: upPair.L1.p, t2: upPair.L2.t, p2: upPair.L2.p };
+   568  // ??base 寃利? up 梨꾨꼸?몃뜲 low媛 base瑜??덈Т ?먯＜/?ш쾶 源⑤㈃ NONE
+   569  {
+   570    const BREACH = atrNow * 0.2;      // ?덉슜 ?댄깉??(異붿쿇: ATR*0.2)
+   571    const RATIO_TH = 0.25;            // ?덉슜 鍮꾩쑉 (異붿쿇: 25%)
+   572    const MIN_N = 20;                // ?쒕낯 理쒖냼 罹붾뱾 ??
+   573  
+   574    let n = 0;
+   575    let bad = 0;
+   576  
+   577    for (const c of slice) {
+   578      if (Number(c.time) < Number(base.t1)) continue; // anchorStartTime ?댄썑留?
+   579      const lp = linePriceAt(base, c.time);
+   580      const breach = lp - c.low;                      // up 梨꾨꼸: base ?꾨옒濡?源⑥쭊 ?뺣룄
+   581      n++;
+   582      if (breach >= BREACH) bad++;
+   583    }
+   584  
+   585    if (n >= MIN_N && bad / n >= RATIO_TH) {
+   586      return none("anchor_fail");
+   587    }
+   588  }
+   589  
+   590     // 2-a) residual ?쒕낯 ?쒗븳: max(base.t2, base.t1) ?댄썑 pivotHigh留?
+   591  const cutoffT = Math.max(Number(base.t2), Number(base.t1));
+   592  
+   593  const residuals: number[] = [];
+   594  for (const ph of pivotHighs) {
+   595    if (Number(ph.t) < cutoffT) continue;
+   596    const baseP = linePriceAt(base, ph.t);
+   597    const res = ph.p - baseP;
+   598    if (res > 0) residuals.push(res);
+   599  }
+   600  
+   601      const off = percentile95Positive(residuals);
+   602      if (off == null) {
+   603        (window as any).__CH_DBG = { why: "residual_sample_lt_5", count: residuals.length, side: "up" };
+   604        return none("residual_sample_lt_5");
+   605      }
+   606  
+   607      
+   608        return dbgOk({
+   609    mode: "up",
+   610    base,
+   611    offset: off,
+   612    breakCount: 0,
+   613    anchorStartTime: base.t1,
+   614  });
+   615  
+   616    }
+   617  
+   618    // DOWN 梨꾨꼸
+   619    const dnPair = pickLHPair(pivotHighs, atrNow, CHANNEL_MIN_SWING_MULT);
+   620    if (!dnPair) if (!dnPair) return none("anchor_fail");
+   621  
+   622    const base: Line2P = { t1: dnPair.H1.t, p1: dnPair.H1.p, t2: dnPair.H2.t, p2: dnPair.H2.p };
+   623  
+   624    // 2-a) residual ?쒕낯 ?쒗븳: max(base.t2, base.t1) ?댄썑 pivotLow留?
+   625  const cutoffT = Math.max(Number(base.t2), Number(base.t1));
+   626  
+   627  const residuals: number[] = [];
+   628  for (const pl of pivotLows) {
+   629    if (Number(pl.t) < cutoffT) continue;
+   630    const baseP = linePriceAt(base, pl.t);
+   631    const res = baseP - pl.p;
+   632    if (res > 0) residuals.push(res);
+   633  }
+   634  
+   635  
+   636    const off = percentile95Positive(residuals);
+   637    if (off == null) {
+   638      (window as any).__CH_DBG = { why: "residual_sample_lt_5", count: residuals.length, side: "down" };
+   639      return none("residual_sample_lt_5");
+   640    }
+   641  
+   642    return {
+   643      mode: "down",
+   644      base,
+   645      offset: off,
+   646      breakCount: 0,
+   647      anchorStartTime: base.t1,
+   648    };
+   649  }
+   650  
+   651  function updateLockedChannel(prev: ChannelState, candles4h: Candle[]): ChannelState {
+   652    // 梨꾨꼸 NONE?닿굅???뚮씪誘명꽣 ?놁쑝硫? 留?4H close留덈떎 ?ъ떆??OK
+   653    if (prev.mode === "none" || !prev.base || !prev.offset) {
+   654      return buildChannelFromScratch(candles4h);
+   655    }
+   656  
+   657    const atr = computeATR(candles4h, 14);
+   658    const i = candles4h.length - 1;
+   659    if (i <= 0) return prev;
+   660  
+   661    const atrNow = atr[i];
+   662    if (!Number.isFinite(atrNow) || atrNow <= 0) return prev;
+   663  
+   664    const c = candles4h[i];
+   665    const lineP = linePriceAt(prev.base, c.time);
+   666    if (!Number.isFinite(lineP)) return prev;
+   667  
+   668    const BREACH = atrNow * 0.2;
+   669  
+   670    // up: 醫낃?媛 base(吏吏) ?꾨옒濡?BREACH ?댁긽 ?댄깉
+   671    // down: 醫낃?媛 base(??? ?꾨줈 BREACH ?댁긽 ?댄깉
+   672    const breach = prev.mode === "up" ? (lineP - c.close) : (c.close - lineP);
+   673    const validBreach = breach >= BREACH;
+   674  
+   675    const newCount = validBreach ? (prev.breakCount ?? 0) + 1 : 0;
+   676  
+   677    // ??2?곗냽?대㈃ Break ?뺤젙 ????踰덉㎏ 遊?close?먯꽌 利됱떆 ?ъ깮??
+   678    if (newCount >= 2) {
+   679      return buildChannelFromScratch(candles4h);
+   680    }
+   681  
+   682    return { ...prev, breakCount: newCount };
+   683  }
+   684  
+   685  
+   686  /* =========================
+   687     Trendline (spec)
+   688  ========================= */
+   689  function buildTrendlineFromScratch(
+   690    candles4h: Candle[],
+   691    keepIfRange: TrendlineState | null
+   692  ): TrendlineState {
+   693    if (candles4h.length < TREND_LOOKBACK + PIVOT_LEN * 2 + 20) {
+   694      return keepIfRange ?? { mode: "none", breakCount: 0 };
+   695    }
+   696  
+   697    const atr = computeATR(candles4h, 14);
+   698    const atrNow = Number.isFinite(atr.at(-1) ?? NaN) ? (atr.at(-1) as number) : NaN;
+   699    if (!Number.isFinite(atrNow) || atrNow <= 0) {
+   700    (window as any).__TR_DBG = { stage: "atr_invalid", atrNow, len: candles4h.length, at: candles4h.at(-1)?.time };
+   701    return { mode: "none", breakCount: 0, why: "anchor_fail" };
+   702  }
+   703  
+   704  
+   705    const startIdx = Math.max(0, candles4h.length - TREND_LOOKBACK);
+   706    const slice = candles4h.slice(startIdx);
+   707    const { swingHigh, swingLow } = findSwingHighsLows(slice, PIVOT_LEN);
+   708  
+   709    const pivotHighs: PivotPoint[] = [];
+   710    const pivotLows: PivotPoint[] = [];
+   711    for (let i = 0; i < slice.length; i++) {
+   712      if (swingHigh[i]) pivotHighs.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].high });
+   713      if (swingLow[i]) pivotLows.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].low });
+   714    }
+   715  
+   716    // =========================
+   717  // 2-b) 援ъ“ ?꾪꽣濡?梨꾨꼸 諛⑺뼢 媛뺤젣
+   718  // HH/HL => up留? LH/LL => down留? mixed => NONE
+   719  // =========================
+   720  if (pivotHighs.length < 2 || pivotLows.length < 2) {
+   721    (window as any).__TR_DBG = {
+   722      stage: "insufficient_pivots",
+   723      pivotHighs: pivotHighs.length,
+   724      pivotLows: pivotLows.length,
+   725      at: candles4h.at(-1)?.time,
+   726    };
+   727    return { mode: "none", breakCount: 0, why: "anchor_fail" };
+   728  }
+   729  
+   730  
+   731  const hPrev = Number(pivotHighs[pivotHighs.length - 2].p);
+   732  const hLast = Number(pivotHighs[pivotHighs.length - 1].p);
+   733  const lPrev = Number(pivotLows[pivotLows.length - 2].p);
+   734  const lLast = Number(pivotLows[pivotLows.length - 1].p);
+   735  
+   736  const finite4 =
+   737    Number.isFinite(hPrev) &&
+   738    Number.isFinite(hLast) &&
+   739    Number.isFinite(lPrev) &&
+   740    Number.isFinite(lLast);
+   741  
+   742  const isUp = finite4 && hLast > hPrev && lLast > lPrev;
+   743  const isDown = finite4 && hLast < hPrev && lLast < lPrev;
+   744  
+   745  const structExtra = {
+   746    hPrev,
+   747    hLast,
+   748    lPrev,
+   749    lLast,
+   750    isUp,
+   751    isDown,
+   752    at: candles4h.at(-1)?.time,
+   753  };
+   754  
+   755  if (isUp && isDown) {
+   756    (window as any).__TR_DBG = {
+   757      stage: "mixed_or_range",
+   758      detail: "both true (unexpected)",
+   759      ...structExtra,
+   760    };
+   761    return keepIfRange ?? { mode: "none", breakCount: 0, why: "mixed_or_range" };
+   762  }
+   763  
+   764  if (!isUp && !isDown) {
+   765    (window as any).__TR_DBG = {
+   766      stage: "mixed_or_range",
+   767      detail: `PH ${hPrev}??{hLast}, PL ${lPrev}??{lLast}`,
+   768      ...structExtra,
+   769    };
+   770    return keepIfRange ?? { mode: "none", breakCount: 0, why: "mixed_or_range" };
+   771  }
+   772  
+   773  
+   774  
+   775    if (isUp) {
+   776      const pair = pickHLPair(pivotLows, atrNow, TREND_MIN_SWING_MULT);
+   777      if (!pair) {
+   778    (window as any).__TR_DBG = { stage: "anchor_fail_up", at: candles4h.at(-1)?.time };
+   779    return { mode: "none", breakCount: 0, why: "anchor_fail" };
+   780  }
+   781  
+   782      const line: Line2P = { t1: pair.L1.t, p1: pair.L1.p, t2: pair.L2.t, p2: pair.L2.p };
+   783      return { mode: "up", line, breakCount: 0, anchorStartTime: line.t1 };
+   784    }
+   785  
+   786    const pair = pickLHPair(pivotHighs, atrNow, TREND_MIN_SWING_MULT);
+   787    if (!pair) {
+   788    (window as any).__TR_DBG = { stage: "anchor_fail_down", at: candles4h.at(-1)?.time };
+   789    return { mode: "none", breakCount: 0, why: "anchor_fail" };
+   790  }
+   791  
+   792    const line: Line2P = { t1: pair.H1.t, p1: pair.H1.p, t2: pair.H2.t, p2: pair.H2.p };
+   793    return { mode: "down", line, breakCount: 0, anchorStartTime: line.t1 };
+   794  }
+   795  
+   796  function updateLockedTrendline(prev: TrendlineState, candles4h: Candle[]): TrendlineState {
+   797    if (prev.mode === "none" || !prev.line) {
+   798      return buildTrendlineFromScratch(candles4h, prev.mode === "none" ? null : prev);
+   799    }
+   800  
+   801    const atr = computeATR(candles4h, 14);
+   802    const i = candles4h.length - 1;
+   803    if (i <= 0) return prev;
+   804  
+   805    const atrNow = atr[i];
+   806    if (!Number.isFinite(atrNow) || atrNow <= 0) return prev;
+   807  
+   808    const c = candles4h[i];
+   809    const lineP = linePriceAt(prev.line, c.time);
+   810    if (!Number.isFinite(lineP)) return prev;
+   811  
+   812    const BREACH = atrNow * 0.2;
+   813  
+   814    // up: 醫낃?媛 ???꾨옒濡?BREACH ?댁긽 ?댄깉
+   815    // down: 醫낃?媛 ???꾨줈 BREACH ?댁긽 ?댄깉
+   816    const breach = prev.mode === "up" ? (lineP - c.close) : (c.close - lineP);
+   817    const validBreach = breach >= BREACH;
+   818  
+   819    const newCount = validBreach ? (prev.breakCount ?? 0) + 1 : 0;
+   820  
+   821    // ??2?곗냽?대㈃ Break ?뺤젙 ??利됱떆 ?ъ꽑???ъ깮??
+   822    if (newCount >= 2) {
+   823      return buildTrendlineFromScratch(candles4h, null);
+   824    }
+   825  
+   826    return { ...prev, breakCount: newCount };
+   827  }
+   828  
+   829  
+   830  /* =========================
+   831     4H BOS/CHOCH + Sweep helpers (confirmed pivots only)
+   832  ========================= */
+   833  type StructureSignals = {
+   834    bosUp: boolean[];
+   835    bosDown: boolean[];
+   836    chochUp: boolean[];
+   837    chochDown: boolean[];
+   838    sweepUp: boolean[]; // recovery close index
+   839    sweepDown: boolean[]; // recovery close index
+   840  };
+   841  
+   842  function computeStructureSignals(candles4h: Candle[], atr: number[]): StructureSignals {
+   843    const n = candles4h.length;
+   844    const { swingHigh, swingLow } = findSwingHighsLows(candles4h, PIVOT_LEN);
+   845  
+   846    const bosUp = new Array<boolean>(n).fill(false);
+   847    const bosDown = new Array<boolean>(n).fill(false);
+   848    const chochUp = new Array<boolean>(n).fill(false);
+   849    const chochDown = new Array<boolean>(n).fill(false);
+   850    const sweepUp = new Array<boolean>(n).fill(false);
+   851    const sweepDown = new Array<boolean>(n).fill(false);
+   852  
+   853    const phList: PivotPoint[] = [];
+   854    const plList: PivotPoint[] = [];
+   855  
+   856    let structureMode: "up" | "down" | "range" = "range";
+   857    let lastHL: PivotPoint | null = null;
+   858    let lastLH: PivotPoint | null = null;
+   859  
+   860    let lastBosUpPivotIdx = -1;
+   861    let lastBosDownPivotIdx = -1;
+   862  
+   863    for (let i = 0; i < n; i++) {
+   864      // confirm pivot at (i - PIVOT_LEN)
+   865      const p = i - PIVOT_LEN;
+   866      if (p >= 0) {
+   867        if (swingHigh[p]) phList.push({ idx: p, t: candles4h[p].time, p: candles4h[p].high });
+   868        if (swingLow[p]) plList.push({ idx: p, t: candles4h[p].time, p: candles4h[p].low });
+   869  
+   870        if (phList.length >= 2 && plList.length >= 2) {
+   871          const hPrev = phList[phList.length - 2].p;
+   872          const hLast = phList[phList.length - 1].p;
+   873          const lPrev = plList[plList.length - 2].p;
+   874          const lLast = plList[plList.length - 1].p;
+   875  
+   876          const isUp = hLast > hPrev && lLast > lPrev;
+   877          const isDown = hLast < hPrev && lLast < lPrev;
+   878  
+   879          if (isUp) {
+   880            structureMode = "up";
+   881            // HL 媛깆떊(吏꾩쭨 higher low???뚮쭔)
+   882            const prevPL = plList.length >= 2 ? plList[plList.length - 2] : null;
+   883            const curPL = plList[plList.length - 1];
+   884            if (prevPL && curPL.p > prevPL.p) lastHL = curPL;
+   885          } else if (isDown) {
+   886            structureMode = "down";
+   887            // LH 媛깆떊(吏꾩쭨 lower high???뚮쭔)
+   888            const prevPH = phList.length >= 2 ? phList[phList.length - 2] : null;
+   889            const curPH = phList[phList.length - 1];
+   890            if (prevPH && curPH.p < prevPH.p) lastLH = curPH;
+   891          } else {
+   892            structureMode = "range";
+   893          }
+   894        }
+   895      }
+   896  
+   897      const prevClose = i > 0 ? candles4h[i - 1].close : candles4h[i].close;
+   898  
+   899      const lastPH = phList.length ? phList[phList.length - 1] : null;
+   900      const lastPL = plList.length ? plList[plList.length - 1] : null;
+   901  
+   902      // BOS
+   903      if (lastPH && lastPH.idx > lastBosUpPivotIdx) {
+   904        if (prevClose <= lastPH.p && candles4h[i].close > lastPH.p) {
+   905          bosUp[i] = true;
+   906          lastBosUpPivotIdx = lastPH.idx;
+   907        }
+   908      }
+   909  
+   910      if (lastPL && lastPL.idx > lastBosDownPivotIdx) {
+   911        if (prevClose >= lastPL.p && candles4h[i].close < lastPL.p) {
+   912          bosDown[i] = true;
+   913          lastBosDownPivotIdx = lastPL.idx;
+   914        }
+   915      }
+   916  
+   917      // CHOCH
+   918      if (structureMode === "up" && lastHL) {
+   919        if (prevClose >= lastHL.p && candles4h[i].close < lastHL.p) chochDown[i] = true;
+   920      }
+   921      if (structureMode === "down" && lastLH) {
+   922        if (prevClose <= lastLH.p && candles4h[i].close > lastLH.p) chochUp[i] = true;
+   923      }
+   924  
+   925      // Sweep -> Recovery (recovery close index = i)
+   926      if (i >= 1) {
+   927        const sweepBar = candles4h[i - 1];
+   928        const recBar = candles4h[i];
+   929        const a = Number.isFinite(atr[i - 1]) ? atr[i - 1] : 0;
+   930        const eqTol = a * 0.1;
+   931  
+   932        const lastPH2 = phList.length >= 2 ? phList[phList.length - 2] : null;
+   933        const lastPH1 = phList.length >= 1 ? phList[phList.length - 1] : null;
+   934        const lastPL2 = plList.length >= 2 ? plList[plList.length - 2] : null;
+   935        const lastPL1 = plList.length >= 1 ? plList[plList.length - 1] : null;
+   936  
+   937        let eqh: number | null = null;
+   938        if (lastPH2 && lastPH1 && Math.abs(lastPH1.p - lastPH2.p) <= eqTol) {
+   939          eqh = Math.max(lastPH1.p, lastPH2.p);
+   940        }
+   941  
+   942        let eql: number | null = null;
+   943        if (lastPL2 && lastPL1 && Math.abs(lastPL1.p - lastPL2.p) <= eqTol) {
+   944          eql = Math.min(lastPL1.p, lastPL2.p);
+   945        }
+   946  
+   947        // Up sweep + recovery close below
+   948        const upTargets: number[] = [];
+   949        if (eqh != null) upTargets.push(eqh);
+   950        if (lastPH1) upTargets.push(lastPH1.p);
+   951  
+   952        for (const lvl of upTargets) {
+   953          if (sweepBar.high > lvl && recBar.close < lvl) {
+   954            sweepUp[i] = true;
+   955            break;
+   956          }
+   957        }
+   958  
+   959        // Down sweep + recovery close above
+   960        const dnTargets: number[] = [];
+   961        if (eql != null) dnTargets.push(eql);
+   962        if (lastPL1) dnTargets.push(lastPL1.p);
+   963  
+   964        for (const lvl of dnTargets) {
+   965          if (sweepBar.low < lvl && recBar.close > lvl) {
+   966            sweepDown[i] = true;
+   967            break;
+   968          }
+   969        }
+   970      }
+   971    }
+   972  
+   973    return { bosUp, bosDown, chochUp, chochDown, sweepUp, sweepDown };
+   974  }
+   975  
+   976  /* =========================
+   977     A+ OB (4H only) + A-grade FVG (4H only)
+   978  ========================= */
+   979  const MAX_ZONES = 80;
+   980  
+   981  
+   982  
+   983  function computeAPlusOBAndAFVG(
+   984    candles4h: Candle[],
+   985    channel: ChannelState,
+   986    trend: TrendlineState
+   987  ): Zone[] {
+   988    const n = candles4h.length;
+   989    if (n < 120) return [];
+   990  
+   991    const atr = computeATR(candles4h, 14);
+   992    const sig = computeStructureSignals(candles4h, atr);
+   993  
+   994    const zones: Zone[] = [];
+   995  // ===== DEBUG: reset CTX per compute run =====
+   996  const g: any = window as any;
+   997  g.__CTX = {
+   998    calls: 0,
+   999    pass: 0,
+  1000    fail: 0,
+  1001    reasons: {},
+  1002    last: null,
+  1003    ts: Date.now(),
+  1004  };
+  1005  
+  1006  
+  1007    // ========= A+ OB =========
+  1008    for (let k = 0; k < n; k++) {
+  1009      const bullImpulse = sig.bosUp[k] || sig.chochUp[k];
+  1010      const bearImpulse = sig.bosDown[k] || sig.chochDown[k];
+  1011      if (!bullImpulse && !bearImpulse) continue;
+  1012  
+  1013      const side: "bull" | "bear" = bullImpulse ? "bull" : "bear";
+  1014      const atrK = Number.isFinite(atr[k]) ? atr[k] : NaN;
+  1015      if (!Number.isFinite(atrK) || atrK <= 0) continue;
+  1016  
+  1017      // displacement(3): max body > ATR*1.0 OR sum3 > ATR*1.8
+  1018      const b0 = Math.max(0, k - 2);
+  1019      let maxBody = 0;
+  1020      let sumBody = 0;
+  1021      for (let i = b0; i <= k; i++) {
+  1022        const body = Math.abs(candles4h[i].close - candles4h[i].open);
+  1023        maxBody = Math.max(maxBody, body);
+  1024        sumBody += body;
+  1025      }
+  1026      const hasDisplacement = maxBody > atrK * 1.0 || sumBody > atrK * 1.8;
+  1027      if (!hasDisplacement) continue;
+  1028  
+  1029      // sweep->recovery required within [k-20..k]
+  1030      const wStart = Math.max(0, k - 20);
+  1031      let hasSweep = false;
+  1032      for (let i = wStart; i <= k; i++) {
+  1033        if (side === "bull" && sig.sweepDown[i]) {
+  1034          hasSweep = true;
+  1035          break;
+  1036        }
+  1037        if (side === "bear" && sig.sweepUp[i]) {
+  1038          hasSweep = true;
+  1039          break;
+  1040        }
+  1041      }
+  1042      if (!hasSweep) continue;
+  1043  
+  1044      // find OB candle: last opposite color in [k-20..k], prefer inside [k-3..k]
+  1045      const impulseStart = Math.max(0, k - 3);
+  1046      let obIdx: number | null = null;
+  1047      let obIdxFallback: number | null = null;
+  1048  
+  1049      for (let j = k; j >= wStart; j--) {
+  1050        const c = candles4h[j];
+  1051        const isOpp = side === "bull" ? c.close < c.open : c.close > c.open;
+  1052        if (!isOpp) continue;
+  1053  
+  1054        if (j >= impulseStart) {
+  1055          obIdx = j;
+  1056          break;
+  1057        }
+  1058        if (obIdxFallback == null) obIdxFallback = j;
+  1059      }
+  1060  
+  1061      if (obIdx == null) obIdx = obIdxFallback;
+  1062      if (obIdx == null) continue;
+  1063  
+  1064      const ob = candles4h[obIdx];
+  1065  
+  1066      // doji 湲곕낯 ?쒖쇅(|c-o|>=0.1*ATR), ?덉쇅??(援ъ“+蹂???ㅼ쐲) 留뚯” ???덉슜 => 吏湲??대? ??留뚯”?덉쑝???듦낵
+  1067      // ?? ?덈Т ?ы븳 ?몄씠利?以꾩씠怨??띠쑝硫??ш린??continue 嫄몄뼱????
+  1068  
+  1069      // OB zone: bull open~low, bear open~high
+  1070      const top = side === "bull" ? ob.open : ob.high;
+  1071      const bottom = side === "bull" ? ob.low : ob.open;
+  1072  
+  1073      const mid = (top + bottom) / 2;
+  1074  
+  1075      // 而⑦뀓?ㅽ듃/嫄곕━ + 諛⑺뼢 ?쇱튂 ?꾩닔
+  1076      if (!passesContextDistance(side, mid, ob.time, atrK, channel, trend, top, bottom)) continue;
+  1077  
+  1078      // invalidate simulation: break 2?곗냽 OR touch>=3(移⑦닾>=ATR*0.1, ?ъ쭊?낅쭔 移댁슫??
+  1079      let touchCount = 0;
+  1080      let invBreakCount = 0;
+  1081      let active = true;
+  1082      let invalidReason: ZoneInvalidReason | undefined = undefined;
+  1083      let endTime: UTCTimestamp | undefined = undefined;
+  1084  
+  1085      let inTouch = false;
+  1086  
+  1087      for (let i = obIdx + 1; i < n; i++) {
+  1088        const c = candles4h[i];
+  1089        const ai = Number.isFinite(atr[i]) ? atr[i] : atrK;
+  1090        if (!Number.isFinite(ai) || ai <= 0) continue;
+  1091  
+  1092        // break invalidation
+  1093        if (side === "bull") {
+  1094          const breach = bottom - c.close;
+  1095          const validBreach = c.close < bottom && breach >= ai * BREAK_ATR_MULT;
+  1096          invBreakCount = validBreach ? invBreakCount + 1 : 0;
+  1097          if (invBreakCount >= 2) {
+  1098            active = false;
+  1099            invalidReason = "break";
+  1100            endTime = to4hCloseTime(c.time);
+  1101            break;
+  1102          }
+  1103        } else {
+  1104          const breach = c.close - top;
+  1105          const validBreach = c.close > top && breach >= ai * BREAK_ATR_MULT;
+  1106          invBreakCount = validBreach ? invBreakCount + 1 : 0;
+  1107          if (invBreakCount >= 2) {
+  1108            active = false;
+  1109            invalidReason = "break";
+  1110            endTime = to4hCloseTime(c.time);
+  1111            break;
+  1112          }
+  1113        }
+  1114  
+  1115        // touches (?ъ쭊?낅쭔 移댁슫??
+  1116        const overlaps = c.low <= top && c.high >= bottom;
+  1117        if (!overlaps) {
+  1118          inTouch = false;
+  1119          continue;
+  1120        }
+  1121  
+  1122        const penetration =
+  1123          side === "bull"
+  1124            ? top - Math.min(c.low, top)
+  1125            : Math.max(c.high, bottom) - bottom;
+  1126  
+  1127        const isRealTouch = penetration >= ai * 0.1;
+  1128  
+  1129        if (isRealTouch && !inTouch) {
+  1130          touchCount++;
+  1131          inTouch = true;
+  1132          if (touchCount >= 3) {
+  1133            active = false;
+  1134            invalidReason = "touches";
+  1135            endTime = to4hCloseTime(c.time);
+  1136            break;
+  1137          }
+  1138        }
+  1139      }
+  1140  
+  1141      zones.push({
+  1142        kind: "OB",
+  1143        side,
+  1144        top,
+  1145        bottom,
+  1146        startTime: ob.time,
+  1147        endTime,
+  1148        active,
+  1149        invalidReason,
+  1150        touchCount,
+  1151      });
+  1152    }
+  1153  
+  1154    // ========= A-grade FVG =========
+  1155    for (let i = 1; i < n - 1; i++) {
+  1156      const cPrev = candles4h[i - 1];
+  1157      const cMid = candles4h[i];
+  1158      const cNext = candles4h[i + 1];
+  1159  
+  1160      const atrI = Number.isFinite(atr[i]) ? atr[i] : NaN;
+  1161      if (!Number.isFinite(atrI) || atrI <= 0) continue;
+  1162  
+  1163      // 3-candle wick FVG
+  1164      let side: "bull" | "bear" | null = null;
+  1165      let top = 0;
+  1166      let bottom = 0;
+  1167  
+  1168      if (cPrev.high < cNext.low) {
+  1169        side = "bull";
+  1170        bottom = cPrev.high;
+  1171        top = cNext.low;
+  1172      } else if (cPrev.low > cNext.high) {
+  1173        side = "bear";
+  1174        bottom = cNext.high;
+  1175        top = cPrev.low;
+  1176      }
+  1177  
+  1178      if (!side) continue;
+  1179  
+  1180    // confirm index = i+1 close
+  1181      const conf = i + 1;
+  1182      if (conf >= n) continue;
+  1183  // =========================
+  1184  // F4) 而⑦뀓?ㅽ듃/嫄곕━ (梨꾨꼸 ?곗꽑, ?놁쑝硫?異붿꽭?? + 諛⑺뼢 ?쇱튂
+  1185  //  - bull FVG??梨꾨꼸 up / ?몃젋??up 而⑦뀓?ㅽ듃留?
+  1186  //  - bear FVG??梨꾨꼸 down / ?몃젋??down 而⑦뀓?ㅽ듃留?
+  1187  // =========================
+  1188  const confTime = candles4h[conf].time;                 // i+1 close ?쒖젏
+  1189  const atrConf = Number.isFinite(atr[conf]) ? atr[conf] : atrI;  // conf ATR (fallback: atrI)
+  1190  
+  1191  // midPrice??zone 以묒븰媛?
+  1192  const midPrice = (top + bottom) / 2;
+  1193  
+  1194  // 而⑦뀓?ㅽ듃 嫄곕━ ?꾪꽣 (?듦낵 紐삵븯硫??ㅽ궢)
+  1195  // NOTE: 而⑦뀓?ㅽ듃(F4)???꾨옒 extra(F2/F3/F4) 怨꾩궛???ы븿. ?ш린??媛뺤젣 continue 湲덉?.
+  1196  
+  1197      // F1 displacement (?꾩닔)
+  1198      const b1 = Math.abs(cPrev.close - cPrev.open);
+  1199      const b2 = Math.abs(cMid.close - cMid.open);
+  1200      const b3 = Math.abs(cNext.close - cNext.open);
+  1201      const maxBody = Math.max(b1, b2, b3);
+  1202      const sumBody = b1 + b2 + b3;
+  1203      const F1 = maxBody > atrI * 1.0 || sumBody > atrI * 1.8;
+  1204      if (!F1) continue;
+  1205  
+  1206      const w0 = Math.max(0, conf - 3);
+  1207      const w1 = Math.min(n - 1, conf + 3);
+  1208  
+  1209      // F2: 짹3??BOS/CHOCH same dir
+  1210      let F2 = false;
+  1211      for (let k = w0; k <= w1; k++) {
+  1212        if (side === "bull" && (sig.bosUp[k] || sig.chochUp[k])) {
+  1213          F2 = true;
+  1214          break;
+  1215        }
+  1216        if (side === "bear" && (sig.bosDown[k] || sig.chochDown[k])) {
+  1217          F2 = true;
+  1218          break;
+  1219        }
+  1220      }
+  1221  
+  1222      // F3: sweep->recovery (bull: sweepDown, bear: sweepUp) within 짹3
+  1223      let F3 = false;
+  1224      for (let k = w0; k <= w1; k++) {
+  1225        if (side === "bull" && sig.sweepDown[k]) {
+  1226          F3 = true;
+  1227          break;
+  1228        }
+  1229        if (side === "bear" && sig.sweepUp[k]) {
+  1230          F3 = true;
+  1231          break;
+  1232        }
+  1233      }
+  1234  
+  1235      // F4: context distance + direction
+  1236      const F4 = passesContextDistance(side, midPrice, confTime, atrConf, channel, trend, top, bottom);
+  1237  
+  1238      const extra = (F2 ? 1 : 0) + (F3 ? 1 : 0) + (F4 ? 1 : 0);
+  1239      if (extra < 2) continue;
+  1240  
+  1241      // invalidate simulation:
+  1242      // - full fill 1??利됱떆)
+  1243      // - opposite CHOCH
+  1244      // - touch>=3 (?ъ쭊??移댁슫??
+  1245      let touchCount = 0;
+  1246      let active = true;
+  1247      let invalidReason: ZoneInvalidReason | undefined = undefined;
+  1248      let endTime: UTCTimestamp | undefined = undefined;
+  1249      let inTouch = false;
+  1250  
+  1251      for (let j = conf + 1; j < n; j++) {
+  1252        const c = candles4h[j];
+  1253        const aj = Number.isFinite(atr[j]) ? atr[j] : atrI;
+  1254  
+  1255        // full fill (wick 湲곗?)
+  1256        const fullFilled =
+  1257          side === "bull"
+  1258            ? c.low <= bottom // bull: bottom源뚯? ?꾩쟾 硫붿?
+  1259            : c.high >= top;  // bear: top源뚯? ?꾩쟾 硫붿?
+  1260  
+  1261        if (fullFilled) {
+  1262          active = false;
+  1263          invalidReason = "fullfill";
+  1264          endTime = to4hCloseTime(c.time);
+  1265          break;
+  1266        }
+  1267  
+  1268        // opposite CHOCH (醫낃? 湲곗?)
+  1269        if (side === "bull" && sig.chochDown[j]) {
+  1270          active = false;
+  1271          invalidReason = "choch";
+  1272          endTime = to4hCloseTime(c.time);
+  1273          break;
+  1274        }
+  1275        if (side === "bear" && sig.chochUp[j]) {
+  1276          active = false;
+  1277          invalidReason = "choch";
+  1278          endTime = to4hCloseTime(c.time);
+  1279          break;
+  1280        }
+  1281  
+  1282        // touch>=3 (wick 湲곗? + ?ъ쭊??
+  1283        const overlaps = c.low <= top && c.high >= bottom;
+  1284        if (!overlaps) {
+  1285          inTouch = false;
+  1286          continue;
+  1287        }
+  1288  
+  1289        // penetration(吏꾩쭨 ?곗튂 媛뺣룄??媛꾨떒??zone ?대? 吏꾩엯?쇰줈 泥섎━)
+  1290        // ?먰븯硫??ш린??ai*0.1 媛숈? 理쒖냼 移⑦닾瑜?異붽? 媛??
+  1291        if (!inTouch) {
+  1292          touchCount++;
+  1293          inTouch = true;
+  1294          if (touchCount >= 3) {
+  1295            active = false;
+  1296            invalidReason = "touches";
+  1297            endTime = to4hCloseTime(c.time);
+  1298            break;
+  1299          }
+  1300        }
+  1301      }
+  1302  
+  1303      zones.push({
+  1304        kind: "FVG",
+  1305        side,
+  1306        top,
+  1307        bottom,
+  1308        startTime: cMid.time,
+  1309        endTime,
+  1310        active,
+  1311        invalidReason,
+  1312        touchCount,
+  1313      });
+  1314    }
+  1315  
+  1316    zones.sort((a, b) => Number(a.startTime) - Number(b.startTime));
+  1317  
+  1318    function dedupeZones(zs: Zone[]) {
+  1319      const m = new Map<string, Zone>();
+  1320      for (const z of zs) {
+  1321        const key =
+  1322          `${z.kind}|${z.side}|${z.startTime}|` +
+  1323          `${Math.round(z.top * 100)}|${Math.round(z.bottom * 100)}`;
+  1324  
+  1325        const prev = m.get(key);
+  1326        if (!prev) m.set(key, z);
+  1327        else {
+  1328          if (!prev.active && z.active) m.set(key, z);
+  1329        }
+  1330      }
+  1331      return Array.from(m.values());
+  1332    }
+  1333  
+  1334    const deduped = dedupeZones(zones);
+  1335    return deduped.length > MAX_ZONES ? deduped.slice(deduped.length - MAX_ZONES) : deduped;
+  1336  }
+  1337  
+  1338  /* =========================
+  1339     Binance fetch (pagination)
+  1340  ========================= */
+  1341  function toBinanceInterval(tf: string) {
+  1342    switch (tf) {
+  1343      case "3m":
+  1344        return "3m";
+  1345      case "5m":
+  1346        return "5m";
+  1347      case "15m":
+  1348        return "15m";
+  1349      case "30m":
+  1350        return "30m";
+  1351      case "1H":
+  1352      case "1h":
+  1353        return "1h";
+  1354      case "2H":
+  1355      case "2h":
+  1356        return "2h";
+  1357      case "4H":
+  1358      case "4h":
+  1359        return "4h";
+  1360      default:
+  1361        return "15m";
+  1362    }
+  1363  }
+  1364  
+  1365  const BINANCE_KLINES_MAX_LIMIT = 1500;
+  1366  const MAX_CANDLES_IN_MEMORY = 3000;
+  1367  
+  1368  async function fetchBinanceKlinesPage(params: {
+  1369    symbol: string;
+  1370    interval: string;
+  1371    limit?: number;
+  1372    endTimeMs?: number;
+  1373  }): Promise<Candle[]> {
+  1374    const { symbol, interval, limit = 500, endTimeMs } = params;
+  1375    const safeLimit = Math.min(Math.max(1, limit), BINANCE_KLINES_MAX_LIMIT);
+  1376  
+  1377    const qs = new URLSearchParams({
+  1378      symbol,
+  1379      interval,
+  1380      limit: String(safeLimit),
+  1381    });
+  1382    if (endTimeMs != null) qs.set("endTime", String(endTimeMs));
+  1383  
+  1384    const url = `https://fapi.binance.com/fapi/v1/klines?${qs.toString()}`;
+  1385    const res = await fetch(url, { cache: "no-store" });
+  1386    if (!res.ok) {
+  1387      const text = await res.text().catch(() => "");
+  1388      throw new Error(`Binance API error: ${res.status} ${text}`);
+  1389    }
+  1390  
+  1391    const raw = (await res.json()) as any[];
+  1392    const candles: Candle[] = raw.map((k) => ({
+  1393      time: Math.floor(Number(k[0]) / 1000) as UTCTimestamp,
+  1394      open: Number(k[1]),
+  1395      high: Number(k[2]),
+  1396      low: Number(k[3]),
+  1397      close: Number(k[4]),
+  1398    }));
+  1399  
+  1400    candles.sort((a, b) => Number(a.time) - Number(b.time));
+  1401    return candles;
+  1402  }
+  1403  
+  1404  async function fetchBinanceKlinesPaginated(params: {
+  1405    symbol: string;
+  1406    interval: string;
+  1407    targetCount: number;
+  1408    pageLimit?: number;
+  1409    maxPages?: number;
+  1410  }): Promise<Candle[]> {
+  1411    const { symbol, interval, targetCount, pageLimit = BINANCE_KLINES_MAX_LIMIT, maxPages = 10 } =
+  1412      params;
+  1413  
+  1414    const pageSize = Math.min(pageLimit, BINANCE_KLINES_MAX_LIMIT);
+  1415    let endTimeMs: number | undefined = Date.now();
+  1416  
+  1417    const byTime = new Map<number, Candle>();
+  1418  
+  1419    for (let page = 0; page < maxPages; page++) {
+  1420      const batch = await fetchBinanceKlinesPage({
+  1421        symbol,
+  1422        interval,
+  1423        limit: pageSize,
+  1424        endTimeMs,
+  1425      });
+  1426  // D) ?ㅼ쓬 ?섏씠吏(??怨쇨굅)濡??대룞?섍린 ?꾪빐 endTimeMs 媛깆떊
+  1427  if (!batch || batch.length === 0) break;
+  1428  
+  1429  // Binance klines??蹂댄넻 ?쒓컙 ?ㅻ쫫李⑥닚?쇰줈 ?ㅻ?濡?batch[0]??"媛??怨쇨굅" 罹붾뱾
+  1430  endTimeMs = Number(batch[0].time) * 1000 - 1;
+  1431  if (byTime.size >= targetCount) break;
+  1432  
+  1433      if (batch.length === 0) break;
+  1434  
+  1435      for (const c of batch) byTime.set(Number(c.time), c);
+  1436  
+  1437      const oldest = batch[0];
+  1438      const nextEndMs = Number(oldest.time) * 1000 - 1;
+  1439  
+  1440      if (endTimeMs != null && nextEndMs >= endTimeMs) break;
+  1441      endTimeMs = nextEndMs;
+  1442    }
+  1443  
+  1444    const merged = Array.from(byTime.values()).sort((a, b) => Number(a.time) - Number(b.time));
+  1445  return merged.slice(Math.max(0, merged.length - targetCount));
+  1446  
+  1447  }
+  1448  
+  1449  async function fetchMoreHistory(params: {
+  1450    symbol: string;
+  1451    interval: string;
+  1452    alreadyHave: Candle[];
+  1453    addCount: number;
+  1454    pageLimit?: number;
+  1455    maxPages?: number;
+  1456  }): Promise<Candle[]> {
+  1457    const { symbol, interval, alreadyHave, addCount, pageLimit = BINANCE_KLINES_MAX_LIMIT, maxPages = 10 } =
+  1458      params;
+  1459  
+  1460    const oldest = alreadyHave[0];
+  1461    if (!oldest) return alreadyHave;
+  1462  
+  1463    let endTimeMs: number | undefined = Number(oldest.time) * 1000 - 1;
+  1464  
+  1465    const byTime = new Map<number, Candle>();
+  1466    for (const c of alreadyHave) byTime.set(Number(c.time), c);
+  1467  
+  1468    let fetchedNew = 0;
+  1469  
+  1470    for (let page = 0; page < maxPages; page++) {
+  1471      const batch = await fetchBinanceKlinesPage({
+  1472        symbol,
+  1473        interval,
+  1474        limit: Math.min(pageLimit, BINANCE_KLINES_MAX_LIMIT),
+  1475        endTimeMs,
+  1476      });
+  1477  
+  1478      if (batch.length === 0) break;
+  1479  
+  1480      for (const c of batch) {
+  1481        const key = Number(c.time);
+  1482        if (!byTime.has(key)) fetchedNew++;
+  1483        byTime.set(key, c);
+  1484      }
+  1485  
+  1486      if (fetchedNew >= addCount) break;
+  1487  
+  1488      const newOldest = batch[0];
+  1489      const nextEndMs = Number(newOldest.time) * 1000 - 1;
+  1490  
+  1491      if (endTimeMs != null && nextEndMs >= endTimeMs) break;
+  1492      endTimeMs = nextEndMs;
+  1493    }
+  1494  
+  1495    return Array.from(byTime.values()).sort((a, b) => Number(a.time) - Number(b.time));
+  1496  }
+  1497  
+  1498  /* =========================
+  1499     Component
+  1500  ========================= */
+  1501  export default function CandleChart({ symbol, tf }: Props) {
+  1502    const interval = useMemo(() => toBinanceInterval(tf), [tf]);
+  1503  
+  1504    const containerRef = useRef<HTMLDivElement | null>(null);
+  1505    const chartRef = useRef<IChartApi | null>(null);
+  1506    const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  1507  
+  1508    const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  1509    const overlayRafRef = useRef<number | null>(null);
+  1510  
+  1511    const rightScaleWRef = useRef(0);
+  1512  
+  1513    // LTF candles
+  1514    const candlesRef = useRef<Candle[]>([]);
+  1515    // 4H candles
+  1516    const candles4hRef = useRef<Candle[]>([]);
+  1517  
+  1518    // overlays from store
+  1519    const zonesRef = useRef<Zone[]>([]);
+  1520    const channelRef = useRef<ChannelState>({ mode: "none", breakCount: 0 });
+  1521    const trendRef = useRef<TrendlineState>({ mode: "none", breakCount: 0 });
+  1522  
+  1523    const wsKlineRef = useRef<WebSocket | null>(null);
+  1524    const wsTradeRef = useRef<WebSocket | null>(null);
+  1525    const ws4hRef = useRef<WebSocket | null>(null);
+  1526  
+  1527    const [error, setError] = useState<string | null>(null);
+  1528    const [lastPrice, setLastPrice] = useState<number | null>(null);
+  1529  
+  1530    const [isLoadingMore, setIsLoadingMore] = useState(false);
+  1531    const isLoadingMoreRef = useRef(false);
+  1532    const lastAutoLoadAtRef = useRef(0);
+  1533  
+  1534    // ==== settings ====
+  1535    const MAX_FORWARD_BARS = 300;
+  1536    const BINANCE_PAGE_LIMIT = 1500;
+  1537  const BINANCE_MAX_PAGES = 10;
+  1538  
+  1539  const LTF_TARGET_CANDLES = 2000; // 珥덇린 濡쒕뱶
+  1540  const LTF_MAX_CANDLES = 3000;    // 硫붾え由?理쒕?
+  1541  const LTF_LOAD_MORE_STEP = 1500; // ??遺덈윭?ㅺ린 1??理쒕?移?
+  1542  
+  1543    const TRENDLINE_STROKE = "rgba(59,130,246,0.90)";
+  1544    const SHOW_INACTIVE_ZONES = true;
+  1545    const SHOW_INACTIVE_LABELS = false;
+  1546  
+  1547    const updateRightScaleW = useCallback(() => {
+  1548      const chart = chartRef.current;
+  1549      if (!chart) return;
+  1550      const w = chart.priceScale("right").width();
+  1551      if (Number.isFinite(w) && w > 0) rightScaleWRef.current = w;
+  1552    }, []);
+  1553  
+  1554    function syncFromStore() {
+  1555      const ctx = getOrInitH4(symbol);
+  1556      zonesRef.current = ctx.zones;
+  1557      channelRef.current = ctx.channel;
+  1558      trendRef.current = ctx.trend;
+  1559    }
+  1560  
+  1561    // ===== drawOverlay =====
+  1562    function drawDebugHUD(ctx: CanvasRenderingContext2D) {
+  1563    const g: any = window as any;
+  1564  
+  1565    const ch = g.__CH_DBG;
+  1566    const tr = g.__TR_DBG;
+  1567    const z  = g.__Z_DBG; // ?덉쑝硫??ъ슜(?놁쑝硫????섏샂)
+  1568    const ctxDbg = g.__CTX;
+  1569  
+  1570  
+  1571    const fmt = (label: string, o: any) => {
+  1572      if (!o) return `${label}: (no dbg)`;
+  1573      const stage = o.stage ?? "";
+  1574      const why = o.why ?? "";
+  1575      const detail = o.detail ?? "";
+  1576      const count = o.count != null ? ` | count=${o.count}` : "";
+  1577      return `${label}: ${stage}${why ? ` | ${why}` : ""}${detail ? ` | ${detail}` : ""}${count}`;
+  1578    };
+  1579  
+  1580    ctx.save();
+  1581    ctx.font = "12px monospace";
+  1582    ctx.fillStyle = "rgba(255,255,255,0.85)";
+  1583    ctx.textBaseline = "top";
+  1584  
+  1585    let y = 8;
+  1586    ctx.fillText(fmt("CH", ch), 8, y); y += 14;
+  1587    ctx.fillText(fmt("TR", tr), 8, y); y += 14;
+  1588    if (ctxDbg) { ctx.fillText(`CTX: calls=${ctxDbg.calls} pass=${ctxDbg.pass} fail=${ctxDbg.fail}`, 8, y); y += 14; }
+  1589  if (z) ctx.fillText(fmt("Z", z), 8, y); y += 14;
+  1590    ctx.restore();
+  1591  } 
+  1592  
+  1593  
+  1594    const drawOverlay = useCallback(() => {
+  1595      const canvas = overlayRef.current;
+  1596      const chart = chartRef.current;
+  1597      const series0 = seriesRef.current;
+  1598      if (!canvas || !chart || !series0) return;
+  1599  
+  1600      const ctx0 = canvas.getContext("2d");
+  1601      if (!ctx0) return;
+  1602  
+  1603      const series: ISeriesApi<"Candlestick"> = series0;
+  1604      const ctx: CanvasRenderingContext2D = ctx0;
+  1605  
+  1606      updateRightScaleW();
+  1607  
+  1608      const w = canvas.clientWidth;
+  1609      const h = canvas.clientHeight;
+  1610      if (w <= 0 || h <= 0) return;
+  1611  
+  1612      const dpr = window.devicePixelRatio || 1;
+  1613      const nextW = Math.floor(w * dpr);
+  1614      const nextH = Math.floor(h * dpr);
+  1615      if (canvas.width !== nextW || canvas.height !== nextH) {
+  1616        canvas.width = nextW;
+  1617        canvas.height = nextH;
+  1618      }
+  1619  
+  1620      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  1621      ctx.clearRect(0, 0, w, h);
+  1622  
+  1623      const clipW = Math.max(0, w - rightScaleWRef.current);
+  1624      ctx.save();
+  1625      ctx.beginPath();
+  1626      ctx.rect(0, 0, clipW, h);
+  1627      ctx.clip();
+  1628  
+  1629      try {
+  1630        const timeScale = chart.timeScale();
+  1631        const plotRightEdge = clipW;
+  1632  
+  1633        const ltfLastTime = candlesRef.current.at(-1)?.time;
+  1634        const ltfFirstTime = candlesRef.current[0]?.time;
+  1635  
+  1636        const forwardSec = MAX_FORWARD_BARS * SEC_4H; // ??ALWAYS 4H 湲곗? (?ㅽ럺 怨좎젙)
+  1637  
+  1638        function clampTimeToLtf(t: UTCTimestamp): UTCTimestamp {
+  1639          let v = Number(t);
+  1640          if (ltfFirstTime != null) v = Math.max(v, Number(ltfFirstTime));
+  1641          if (ltfLastTime != null) v = Math.min(v, Number(ltfLastTime) + forwardSec);
+  1642          return v as UTCTimestamp;
+  1643        }
+  1644  
+  1645        function normX(a: number, b: number) {
+  1646          const left = Math.min(a, b);
+  1647          const right = Math.max(a, b);
+  1648          return { left, right };
+  1649        }
+  1650  
+  1651        function safeTimeToX(t: UTCTimestamp) {
+  1652          const x = timeScale.timeToCoordinate(t as any);
+  1653          return x == null ? null : x;
+  1654        }
+  1655  
+  1656        function safePriceToY(p: number) {
+  1657          const y = series.priceToCoordinate(p);
+  1658          return y == null ? null : y;
+  1659        }
+  1660  
+  1661        const tVisLeft = coordTimeToSec(timeScale.coordinateToTime(0));
+  1662        const tVisRight = coordTimeToSec(timeScale.coordinateToTime(plotRightEdge));
+  1663  
+  1664        // ========== 1) CHANNEL FILL (behind) ==========
+  1665        const ch = channelRef.current;
+  1666  
+  1667        if (ch.mode !== "none" && ch.base && ch.offset && ltfLastTime != null) {
+  1668          const base = ch.base;
+  1669          const off = ch.offset;
+  1670  
+  1671          const tStartRaw = Math.max(
+  1672            Number(ch.anchorStartTime ?? base.t1),
+  1673            Number(tVisLeft ?? base.t1)
+  1674          ) as UTCTimestamp;
+  1675  
+  1676          const tEndLimit = (Number(ltfLastTime) + forwardSec) as UTCTimestamp;
+  1677          const tEndRaw = Math.min(Number(tVisRight ?? ltfLastTime), Number(tEndLimit)) as UTCTimestamp;
+  1678  
+  1679          const tL = clampTimeToLtf(tStartRaw);
+  1680          const tR = clampTimeToLtf(tEndRaw);
+  1681  
+  1682          const xL0 = safeTimeToX(tL);
+  1683          const xR0 = safeTimeToX(tR);
+  1684          const xA = xL0 ?? 0;
+  1685          const xB = xR0 ?? plotRightEdge;
+  1686          const { left: xL, right: xR } = normX(xA, xB);
+  1687  
+  1688          if (xR - xL >= 2) {
+  1689            const baseLP = linePriceAt(base, tL);
+  1690            const baseRP = linePriceAt(base, tR);
+  1691  
+  1692            const parLP = ch.mode === "up" ? baseLP + off : baseLP - off;
+  1693            const parRP = ch.mode === "up" ? baseRP + off : baseRP - off;
+  1694  
+  1695            const midLP = ch.mode === "up" ? baseLP + off * 0.5 : baseLP - off * 0.5;
+  1696            const midRP = ch.mode === "up" ? baseRP + off * 0.5 : baseRP - off * 0.5;
+  1697  
+  1698            const yBaseL = safePriceToY(baseLP);
+  1699            const yBaseR = safePriceToY(baseRP);
+  1700            const yParL = safePriceToY(parLP);
+  1701            const yParR = safePriceToY(parRP);
+  1702            const yMidL = safePriceToY(midLP);
+  1703            const yMidR = safePriceToY(midRP);
+  1704  
+  1705            if (yBaseL != null && yBaseR != null && yParL != null && yParR != null) {
+  1706              ctx.fillStyle = "rgba(255,255,255,0.06)";
+  1707              ctx.beginPath();
+  1708              ctx.moveTo(xL, yBaseL);
+  1709              ctx.lineTo(xR, yBaseR);
+  1710              ctx.lineTo(xR, yParR);
+  1711              ctx.lineTo(xL, yParL);
+  1712              ctx.closePath();
+  1713              ctx.fill();
+  1714  
+  1715              if (yMidL != null && yMidR != null) {
+  1716                ctx.strokeStyle = "rgba(255,255,255,0.18)";
+  1717                ctx.lineWidth = 1;
+  1718                ctx.setLineDash([6, 6]);
+  1719                ctx.beginPath();
+  1720                ctx.moveTo(xL, yMidL);
+  1721                ctx.lineTo(xR, yMidR);
+  1722                ctx.stroke();
+  1723                ctx.setLineDash([]);
+  1724              }
+  1725            }
+  1726          }
+  1727        }
+  1728  
+  1729        // ========== 2) Boxes ==========
+  1730        const zones = zonesRef.current ?? [];
+  1731        const inactiveAll = zones.filter((z) => !z.active);
+  1732        const inactive = inactiveAll.slice(Math.max(0, inactiveAll.length - 20)); // 鍮꾪솢??20媛쒕쭔
+  1733        const activeFVG = zones.filter((z) => z.active && z.kind === "FVG");
+  1734        const activeOB = zones.filter((z) => z.active && z.kind === "OB");
+  1735  
+  1736        function drawZone(z: Zone, style: "inactive" | "active") {
+  1737          const ltfFirst = candlesRef.current[0]?.time;
+  1738  
+  1739          const tStart = (ltfFirst != null
+  1740            ? (Math.max(Number(z.startTime), Number(ltfFirst)) as UTCTimestamp)
+  1741            : z.startTime) as UTCTimestamp;
+  1742  
+  1743          const x1 = safeTimeToX(tStart);
+  1744          if (x1 == null) return;
+  1745  
+  1746          let x2: number | null = null;
+  1747  
+  1748          if (style === "inactive") {
+  1749            if (!z.endTime) return;
+  1750            if (ltfFirst != null && Number(z.endTime) < Number(ltfFirst)) return;
+  1751  
+  1752            const tEnd = (ltfFirst != null
+  1753              ? (Math.max(Number(z.endTime), Number(ltfFirst)) as UTCTimestamp)
+  1754              : z.endTime) as UTCTimestamp;
+  1755  
+  1756            x2 = safeTimeToX(tEnd);
+  1757            if (x2 == null) return;
+  1758          } else {
+  1759            if (ltfLastTime != null) {
+  1760              const tLimit = (Number(ltfLastTime) + forwardSec) as UTCTimestamp;
+  1761              const tRight = tVisRight ?? tLimit;
+  1762              const tClamped = Math.min(Number(tRight), Number(tLimit)) as UTCTimestamp;
+  1763              x2 = safeTimeToX(tClamped);
+  1764            }
+  1765            if (x2 == null) x2 = plotRightEdge;
+  1766          }
+  1767  
+  1768          const left = Math.max(0, Math.min(x1, x2));
+  1769          const right = Math.min(plotRightEdge, Math.max(x1, x2));
+  1770          if (right - left < 1) return;
+  1771  
+  1772          const yTop = safePriceToY(z.top);
+  1773          const yBot = safePriceToY(z.bottom);
+  1774          if (yTop == null || yBot == null) return;
+  1775  
+  1776          const topPx = Math.min(yTop, yBot);
+  1777          const botPx = Math.max(yTop, yBot);
+  1778          if (botPx - topPx < 1) return;
+  1779  
+  1780          const isBull = z.side === "bull";
+  1781          const isOB = z.kind === "OB";
+  1782  
+  1783          if (style === "active") {
+  1784            ctx.fillStyle = isBull
+  1785              ? isOB
+  1786                ? "rgba(34,197,94,0.22)"
+  1787                : "rgba(34,197,94,0.14)"
+  1788              : isOB
+  1789              ? "rgba(239,68,68,0.22)"
+  1790              : "rgba(239,68,68,0.14)";
+  1791  
+  1792            ctx.strokeStyle = isBull
+  1793              ? isOB
+  1794                ? "rgba(34,197,94,0.85)"
+  1795                : "rgba(34,197,94,0.60)"
+  1796              : isOB
+  1797              ? "rgba(239,68,68,0.85)"
+  1798              : "rgba(239,68,68,0.60)";
+  1799  
+  1800            ctx.lineWidth = isOB ? 2.0 : 1.6;
+  1801          } else {
+  1802            ctx.fillStyle = "rgba(255,255,255,0.00)";
+  1803            ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  1804            ctx.lineWidth = 1.0;
+  1805          }
+  1806  
+  1807          ctx.fillRect(left, topPx, right - left, botPx - topPx);
+  1808          ctx.strokeRect(left, topPx, right - left, botPx - topPx);
+  1809  
+  1810          // label
+  1811          ctx.font = "12px sans-serif";
+  1812          if (style === "active") {
+  1813            const tag = isOB ? "OB" : "FVG";
+  1814            const padX = 6;
+  1815            const padY = 4;
+  1816            const textW = ctx.measureText(tag).width;
+  1817  
+  1818            ctx.fillStyle = "rgba(0,0,0,0.55)";
+  1819            ctx.fillRect(left + 6, topPx + 6, textW + padX * 2, 16 + padY);
+  1820  
+  1821            ctx.fillStyle = isBull ? "rgba(34,197,94,0.95)" : "rgba(239,68,68,0.95)";
+  1822            ctx.fillText(tag, left + 6 + padX, topPx + 6 + 14);
+  1823          } else {
+  1824            if (SHOW_INACTIVE_LABELS) {
+  1825              ctx.fillStyle = "rgba(255,255,255,0.35)";
+  1826              const reason = z.invalidReason ? ` (${z.invalidReason})` : "";
+  1827              ctx.fillText(`INVALID${reason}`, left + 8, topPx + 16);
+  1828            }
+  1829          }
+  1830        }
+  1831  
+  1832        if (SHOW_INACTIVE_ZONES) {
+  1833          for (const z of inactive) drawZone(z, "inactive");
+  1834        }
+  1835        for (const z of activeFVG) drawZone(z, "active");
+  1836        for (const z of activeOB) drawZone(z, "active");
+  1837  
+  1838        // ========== 3) Lines (topmost): channel lines + trendline ==========
+  1839        // Channel lines
+  1840        if (ch.mode !== "none" && ch.base && ch.offset && ltfLastTime != null) {
+  1841          const base = ch.base;
+  1842          const off = ch.offset;
+  1843  
+  1844          const tStartRaw = Math.max(
+  1845            Number(ch.anchorStartTime ?? base.t1),
+  1846            Number(tVisLeft ?? base.t1)
+  1847          ) as UTCTimestamp;
+  1848  
+  1849          const tEndLimit = (Number(ltfLastTime) + forwardSec) as UTCTimestamp;
+  1850          const tEndRaw = Math.min(Number(tVisRight ?? ltfLastTime), Number(tEndLimit)) as UTCTimestamp;
+  1851  
+  1852          const tL = clampTimeToLtf(tStartRaw);
+  1853          const tR = clampTimeToLtf(tEndRaw);
+  1854  
+  1855          const xL0 = safeTimeToX(tL);
+  1856          const xR0 = safeTimeToX(tR);
+  1857          const xA = xL0 ?? 0;
+  1858          const xB = xR0 ?? plotRightEdge;
+  1859          const { left: xL, right: xR } = normX(xA, xB);
+  1860  
+  1861          if (xR - xL >= 2) {
+  1862            const baseLP = linePriceAt(base, tL);
+  1863            const baseRP = linePriceAt(base, tR);
+  1864  
+  1865            const parLP = ch.mode === "up" ? baseLP + off : baseLP - off;
+  1866            const parRP = ch.mode === "up" ? baseRP + off : baseRP - off;
+  1867  
+  1868            const yBaseL = safePriceToY(baseLP);
+  1869            const yBaseR = safePriceToY(baseRP);
+  1870            const yParL = safePriceToY(parLP);
+  1871            const yParR = safePriceToY(parRP);
+  1872  
+  1873            if (yBaseL != null && yBaseR != null && yParL != null && yParR != null) {
+  1874              ctx.strokeStyle = "rgba(255,255,255,0.70)";
+  1875              ctx.lineWidth = 1.6;
+  1876              ctx.beginPath();
+  1877              ctx.moveTo(xL, yBaseL);
+  1878              ctx.lineTo(xR, yBaseR);
+  1879              ctx.stroke();
+  1880  
+  1881              ctx.strokeStyle = "rgba(255,255,255,0.50)";
+  1882              ctx.lineWidth = 1.6;
+  1883              ctx.beginPath();
+  1884              ctx.moveTo(xL, yParL);
+  1885              ctx.lineTo(xR, yParR);
+  1886              ctx.stroke();
+  1887  
+  1888              ctx.font = "12px sans-serif";
+  1889              ctx.fillStyle = "rgba(255,255,255,0.85)";
+  1890              const yLabel = Math.min(yBaseL, yParL) - 6;
+  1891              ctx.fillText(ch.mode === "up" ? "CHANNEL (UP)" : "CHANNEL (DOWN)", xL + 8, Math.max(14, yLabel));
+  1892            }
+  1893          }
+  1894        }
+  1895  
+  1896        // Trendline
+  1897        const tr = trendRef.current;
+  1898        if (tr.mode !== "none" && tr.line && ltfLastTime != null) {
+  1899          const line = tr.line;
+  1900  
+  1901          const tStartRaw = Math.max(
+  1902            Number(tr.anchorStartTime ?? line.t1),
+  1903            Number(tVisLeft ?? line.t1)
+  1904          ) as UTCTimestamp;
+  1905  
+  1906          const tEndLimit = (Number(ltfLastTime) + forwardSec) as UTCTimestamp;
+  1907          const tEndRaw = Math.min(Number(tVisRight ?? ltfLastTime), Number(tEndLimit)) as UTCTimestamp;
+  1908  
+  1909          const tL = clampTimeToLtf(tStartRaw);
+  1910          const tR = clampTimeToLtf(tEndRaw);
+  1911  
+  1912          const xL0 = safeTimeToX(tL);
+  1913          const xR0 = safeTimeToX(tR);
+  1914          const xA = xL0 ?? 0;
+  1915          const xB = xR0 ?? plotRightEdge;
+  1916          const { left: xL, right: xR } = normX(xA, xB);
+  1917  
+  1918          if (xR - xL >= 2) {
+  1919            const pL = linePriceAt(line, tL);
+  1920            const pR = linePriceAt(line, tR);
+  1921  
+  1922            const yL = safePriceToY(pL);
+  1923            const yR = safePriceToY(pR);
+  1924  
+  1925            if (yL != null && yR != null) {
+  1926              ctx.strokeStyle = TRENDLINE_STROKE;
+  1927              ctx.lineWidth = 2.0;
+  1928              ctx.beginPath();
+  1929              ctx.moveTo(xL, yL);
+  1930              ctx.lineTo(xR, yR);
+  1931              ctx.stroke();
+  1932  
+  1933              ctx.font = "12px sans-serif";
+  1934              ctx.fillStyle = "rgba(255,255,255,0.85)";
+  1935              ctx.fillText(tr.mode === "up" ? "TREND (UP)" : "TREND (DOWN)", xL + 8, Math.max(14, yL - 6));
+  1936            }
+  1937          }
+  1938        }
+  1939      } finally {
+  1940        if (DEBUG_HUD) drawDebugHUD(ctx);
+  1941        ctx.restore();
+  1942      }
+  1943    }, [MAX_FORWARD_BARS, SHOW_INACTIVE_LABELS, SHOW_INACTIVE_ZONES, TRENDLINE_STROKE, tf, updateRightScaleW]);
+  1944  
+  1945    const scheduleDrawOverlay = useCallback(() => {
+  1946      if (overlayRafRef.current != null) return;
+  1947      overlayRafRef.current = window.requestAnimationFrame(() => {
+  1948        overlayRafRef.current = null;
+  1949        drawOverlay();
+  1950      });
+  1951    }, [drawOverlay]);
+  1952  
+  1953    // ===== Load more (LTF only) =====
+  1954    const handleLoadMore = useCallback(async () => {
+  1955      if (isLoadingMoreRef.current) return;
+  1956  
+  1957      try {
+  1958        isLoadingMoreRef.current = true;
+  1959        setIsLoadingMore(true);
+  1960        setError(null);
+  1961  
+  1962        const series = seriesRef.current;
+  1963        const chart = chartRef.current;
+  1964        if (!series || !chart) return;
+  1965  
+  1966        const current = candlesRef.current;
+  1967        if (!current.length) return;
+  1968  
+  1969        const prevLen = current.length;
+  1970        const need = Math.min(
+  1971    LTF_LOAD_MORE_STEP,
+  1972    Math.max(0, LTF_MAX_CANDLES - current.length)
+  1973  );
+  1974  if (need <= 0) return;
+  1975  
+  1976  
+  1977        const merged = await fetchMoreHistory({
+  1978          symbol,
+  1979          interval,
+  1980          alreadyHave: current,
+  1981          addCount: need,
+  1982          pageLimit: BINANCE_PAGE_LIMIT,
+  1983          maxPages: BINANCE_MAX_PAGES,
+  1984        });
+  1985  
+  1986        const beforeRange = chart.timeScale().getVisibleLogicalRange();
+  1987  
+  1988        series.setData(merged);
+  1989        candlesRef.current = merged;
+  1990  
+  1991        const delta = merged.length - prevLen;
+  1992        if (beforeRange && delta > 0) {
+  1993          chart.timeScale().setVisibleLogicalRange({
+  1994            from: beforeRange.from + delta,
+  1995            to: beforeRange.to + delta,
+  1996          });
+  1997        }
+  1998  
+  1999        syncFromStore();
+  2000        updateRightScaleW();
+  2001        scheduleDrawOverlay();
+  2002      } catch (e: any) {
+  2003        setError(e?.message ?? "怨쇨굅 ?곗씠??濡쒕뱶 ?ㅽ뙣");
+  2004      } finally {
+  2005        isLoadingMoreRef.current = false;
+  2006        setIsLoadingMore(false);
+  2007      }
+  2008    }, [interval, scheduleDrawOverlay, symbol, updateRightScaleW]);
+  2009  
+  2010  useEffect(() => {
+  2011    (window as any).__DBG_VERSION = "dbg_v1";
+  2012    (window as any).__CH_DBG = (window as any).__CH_DBG ?? { init: true };
+  2013    (window as any).__TR_DBG = (window as any).__TR_DBG ?? { init: true };
+  2014    (window as any).__H4_CTX = (window as any).__H4_CTX ?? { init: true };
+  2015  }, []);
+  2016  
+  2017    // ===== AUTO LOAD =====
+  2018    useEffect(() => {
+  2019      const chart = chartRef.current;
+  2020      if (!chart) return;
+  2021  
+  2022      const timeScale = chart.timeScale();
+  2023      const AUTO_LOAD_THRESHOLD = 20;
+  2024      const AUTO_LOAD_COOLDOWN_MS = 1200;
+  2025  
+  2026      const onVisibleLogicalRangeChange = (range: LogicalRange | null) => {
+  2027        if (!range) return;
+  2028  
+  2029        const len = candlesRef.current.length;
+  2030        if (len > 0 && range.from <= 0 && range.to >= len - 1 - 2) return;
+  2031  
+  2032        if (range.from <= AUTO_LOAD_THRESHOLD) {
+  2033          const now = Date.now();
+  2034          if (isLoadingMoreRef.current) return;
+  2035          if (now - lastAutoLoadAtRef.current < AUTO_LOAD_COOLDOWN_MS) return;
+  2036  
+  2037          lastAutoLoadAtRef.current = now;
+  2038          handleLoadMore();
+  2039        }
+  2040  
+  2041        scheduleDrawOverlay();
+  2042      };
+  2043  
+  2044      timeScale.subscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange);
+  2045      return () => {
+  2046        timeScale.unsubscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChange);
+  2047      };
+  2048    }, [handleLoadMore, scheduleDrawOverlay]);
+  2049  
+  2050    // ===== Chart create (once) =====
+  2051    useEffect(() => {
+  2052      setError(null);
+  2053      if (!containerRef.current) return;
+  2054  
+  2055      const chart = createChart(containerRef.current, {
+  2056        height: 520,
+  2057        layout: { background: { color: "#09090b" }, textColor: "#e4e4e7" },
+  2058        grid: {
+  2059          vertLines: { color: "#27272a" },
+  2060          horzLines: { color: "#27272a" },
+  2061        },
+  2062        rightPriceScale: { borderColor: "#27272a" },
+  2063        timeScale: {
+  2064          borderColor: "#27272a",
+  2065          rightOffset: 10,
+  2066          fixRightEdge: false,
+  2067          lockVisibleTimeRangeOnResize: true,
+  2068        },
+  2069        crosshair: { mode: CrosshairMode.Magnet },
+  2070      });
+  2071  
+  2072      const series = chart.addCandlestickSeries({
+  2073        upColor: "#22c55e",
+  2074        downColor: "#ef4444",
+  2075        wickUpColor: "#22c55e",
+  2076        wickDownColor: "#ef4444",
+  2077        borderVisible: false,
+  2078      });
+  2079  
+  2080      chartRef.current = chart;
+  2081      seriesRef.current = series;
+  2082  
+  2083      updateRightScaleW();
+  2084  
+  2085      const timeScale = chart.timeScale();
+  2086  
+  2087      const onVisibleTimeRange = () => {
+  2088        updateRightScaleW();
+  2089        scheduleDrawOverlay();
+  2090      };
+  2091      const onCrosshairMove = () => scheduleDrawOverlay();
+  2092  
+  2093      timeScale.subscribeVisibleTimeRangeChange(onVisibleTimeRange);
+  2094      chart.subscribeCrosshairMove(onCrosshairMove);
+  2095  
+  2096      const ro = new ResizeObserver(() => {
+  2097        const el = containerRef.current;
+  2098        if (!el) return;
+  2099        const width = el.clientWidth;
+  2100        chart.applyOptions({ width });
+  2101        requestAnimationFrame(() => {
+  2102          updateRightScaleW();
+  2103          scheduleDrawOverlay();
+  2104        });
+  2105      });
+  2106      ro.observe(containerRef.current);
+  2107  
+  2108      return () => {
+  2109        ro.disconnect();
+  2110        timeScale.unsubscribeVisibleTimeRangeChange(onVisibleTimeRange);
+  2111        chart.unsubscribeCrosshairMove(onCrosshairMove);
+  2112  
+  2113        chart.remove();
+  2114        chartRef.current = null;
+  2115        seriesRef.current = null;
+  2116      };
+  2117    }, [scheduleDrawOverlay, updateRightScaleW]);
+  2118  
+  2119    // ===== Initial load (LTF candles) =====
+  2120    useEffect(() => {
+  2121      let cancelled = false;
+  2122  
+  2123      (async () => {
+  2124        try {
+  2125          setError(null);
+  2126  
+  2127          const series = seriesRef.current;
+  2128          const chart = chartRef.current;
+  2129          if (!series || !chart) return;
+  2130  
+  2131          const TARGET_CANDLES = LTF_TARGET_CANDLES;
+  2132          const data = await fetchBinanceKlinesPaginated({
+  2133            symbol,
+  2134            interval,
+  2135            targetCount: TARGET_CANDLES,
+  2136            pageLimit: BINANCE_PAGE_LIMIT,
+  2137            maxPages: BINANCE_MAX_PAGES,
+  2138          });
+  2139  
+  2140          if (cancelled) return;
+  2141  
+  2142          series.setData(data);
+  2143          candlesRef.current = data;
+  2144          setLastPrice(data.at(-1)?.close ?? null);
+  2145  
+  2146          chart.timeScale().fitContent();
+  2147  
+  2148          syncFromStore();
+  2149          updateRightScaleW();
+  2150          scheduleDrawOverlay();
+  2151        } catch (e: any) {
+  2152          if (cancelled) return;
+  2153          setError(e?.message ?? "?곗씠??濡쒕뱶 ?ㅽ뙣");
+  2154        }
+  2155      })();
+  2156  
+  2157      return () => {
+  2158        cancelled = true;
+  2159      };
+  2160    }, [interval, scheduleDrawOverlay, symbol, updateRightScaleW]);
+  2161  
+  2162    // ===== Initial load (4H context candles) =====
+  2163    useEffect(() => {
+  2164      let cancelled = false;
+  2165  
+  2166      (async () => {
+  2167        try {
+  2168          const data4h = await fetchBinanceKlinesPaginated({
+  2169            symbol,
+  2170            interval: "4h",
+  2171            targetCount: 1400,
+  2172            pageLimit: 1500,
+  2173            maxPages: 10,
+  2174          });
+  2175          if (cancelled) return;
+  2176  
+  2177          candles4hRef.current = data4h;
+  2178  
+  2179          const prev = getOrInitH4(symbol);
+  2180          const nextChannel = updateLockedChannel(prev.channel, data4h);
+  2181          const nextTrend = updateLockedTrendline(prev.trend, data4h);
+  2182          const nextZones = computeAPlusOBAndAFVG(data4h, nextChannel, nextTrend);
+  2183  
+  2184          const next: H4Context = {
+  2185            channel: nextChannel,
+  2186            trend: nextTrend,
+  2187            zones: nextZones,
+  2188            last4hTime: data4h.at(-1)?.time,
+  2189          };
+  2190  
+  2191          setH4(symbol, next);
+  2192          syncFromStore();
+  2193          scheduleDrawOverlay();
+  2194        } catch (e: any) {
+  2195          setError((prevErr) => prevErr ?? `4H context load failed: ${e?.message ?? ""}`);
+  2196        }
+  2197      })();
+  2198  
+  2199      return () => {
+  2200        cancelled = true;
+  2201      };
+  2202    }, [scheduleDrawOverlay, symbol]);
+  2203  
+  2204    // ===== WS (LTF) =====
+  2205    useEffect(() => {
+  2206      wsKlineRef.current?.close();
+  2207      wsTradeRef.current?.close();
+  2208      wsKlineRef.current = null;
+  2209      wsTradeRef.current = null;
+  2210  
+  2211      const series = seriesRef.current;
+  2212      if (!series) return;
+  2213  
+  2214      const symLower = symbol.toLowerCase();
+  2215  
+  2216      const wsKline = new WebSocket(`wss://fstream.binance.com/ws/${symLower}@kline_${interval}`);
+  2217      wsKlineRef.current = wsKline;
+  2218  
+  2219      wsKline.onmessage = (ev) => {
+  2220        try {
+  2221          const msg = JSON.parse(ev.data) as WsKlineMsg;
+  2222          if (msg.e !== "kline" || !msg.k) return;
+  2223  
+  2224          const c: Candle = {
+  2225            time: Math.floor(msg.k.t / 1000) as UTCTimestamp,
+  2226            open: Number(msg.k.o),
+  2227            high: Number(msg.k.h),
+  2228            low: Number(msg.k.l),
+  2229            close: Number(msg.k.c),
+  2230          };
+  2231  
+  2232          series.update(c);
+  2233          setLastPrice(c.close);
+  2234  
+  2235          const arr = candlesRef.current;
+  2236          const last = arr[arr.length - 1];
+  2237  
+  2238          if (!last || last.time < c.time) {
+  2239            arr.push(c);
+  2240            if (arr.length > MAX_CANDLES_IN_MEMORY) arr.shift();
+  2241          } else if (last.time === c.time) {
+  2242            arr[arr.length - 1] = c;
+  2243          }
+  2244  
+  2245          syncFromStore();
+  2246          updateRightScaleW();
+  2247          scheduleDrawOverlay();
+  2248        } catch {
+  2249          // ignore
+  2250        }
+  2251      };
+  2252  
+  2253      const wsTrade = new WebSocket(`wss://fstream.binance.com/ws/${symLower}@aggTrade`);
+  2254      wsTradeRef.current = wsTrade;
+  2255  
+  2256      wsTrade.onmessage = (ev) => {
+  2257        try {
+  2258          const msg = JSON.parse(ev.data) as WsAggTradeMsg;
+  2259          if (msg.e !== "aggTrade") return;
+  2260          const p = Number(msg.p);
+  2261          if (!Number.isFinite(p)) return;
+  2262          setLastPrice(p);
+  2263          updateRightScaleW();
+  2264          scheduleDrawOverlay();
+  2265        } catch {
+  2266          // ignore
+  2267        }
+  2268      };
+  2269  
+  2270      wsKline.onerror = () => setError("kline websocket error");
+  2271      wsTrade.onerror = () => setError("trade websocket error");
+  2272  
+  2273      return () => {
+  2274        wsKline.close();
+  2275        wsTrade.close();
+  2276        wsKlineRef.current = null;
+  2277        wsTradeRef.current = null;
+  2278      };
+  2279    }, [interval, scheduleDrawOverlay, symbol, updateRightScaleW]);
+  2280  
+  2281    // ===== WS (4H always) =====
+  2282    useEffect(() => {
+  2283      ws4hRef.current?.close();
+  2284      ws4hRef.current = null;
+  2285  
+  2286      const symLower = symbol.toLowerCase();
+  2287      const ws4h = new WebSocket(`wss://fstream.binance.com/ws/${symLower}@kline_4h`);
+  2288      ws4hRef.current = ws4h;
+  2289  
+  2290      ws4h.onmessage = (ev) => {
+  2291        try {
+  2292          const msg = JSON.parse(ev.data) as WsKlineMsg;
+  2293          if (msg.e !== "kline" || !msg.k) return;
+  2294  
+  2295          const c: Candle = {
+  2296            time: Math.floor(msg.k.t / 1000) as UTCTimestamp,
+  2297            open: Number(msg.k.o),
+  2298            high: Number(msg.k.h),
+  2299            low: Number(msg.k.l),
+  2300            close: Number(msg.k.c),
+  2301          };
+  2302  
+  2303          const arr = candles4hRef.current;
+  2304          const last = arr[arr.length - 1];
+  2305  
+  2306          if (!last || last.time < c.time) {
+  2307            arr.push(c);
+  2308            if (arr.length > 2000) arr.shift();
+  2309          } else if (last.time === c.time) {
+  2310            arr[arr.length - 1] = c;
+  2311          }
+  2312  
+  2313          if (msg.k.x) {
+  2314            // only on 4H close
+  2315            const prev = getOrInitH4(symbol);
+  2316            const nextChannel = updateLockedChannel(prev.channel, arr);
+  2317            const nextTrend = updateLockedTrendline(prev.trend, arr);
+  2318            // ===== DEBUG: reset CTX per compute run =====
+  2319  const g: any = window as any;
+  2320  g.__CTX = {
+  2321    calls: 0,
+  2322    pass: 0,
+  2323    fail: 0,
+  2324    reasons: {},
+  2325    last: null,
+  2326    ts: Date.now(),
+  2327  };
+  2328  
+  2329            const nextZones = computeAPlusOBAndAFVG(arr, nextChannel, nextTrend);
+  2330  
+  2331            const next: H4Context = {
+  2332              channel: nextChannel,
+  2333              trend: nextTrend,
+  2334              zones: nextZones,
+  2335              last4hTime: c.time,
+  2336            };
+  2337  
+  2338            setH4(symbol, next);
+  2339            syncFromStore();
+  2340          }
+  2341  
+  2342          scheduleDrawOverlay();
+  2343        } catch {
+  2344          // ignore
+  2345        }
+  2346      };
+  2347  
+  2348      ws4h.onerror = () => setError("4H websocket error");
+  2349  
+  2350      return () => {
+  2351        ws4h.close();
+  2352        ws4hRef.current = null;
+  2353      };
+  2354    }, [scheduleDrawOverlay, symbol]);
+  2355  
+  2356    // overlay rAF cleanup
+  2357    useEffect(() => {
+  2358      return () => {
+  2359        if (overlayRafRef.current != null) {
+  2360          cancelAnimationFrame(overlayRafRef.current);
+  2361          overlayRafRef.current = null;
+  2362        }
+  2363      };
+  2364    }, []);
+  2365  
+  2366    return (
+  2367      <div className="relative h-[520px] w-full">
+  2368        <div ref={containerRef} className="h-[520px] w-full" />
+  2369        <canvas ref={overlayRef} className="pointer-events-none absolute inset-0 z-20 h-[520px] w-full" />
+  2370  
+  2371        {error && (
+  2372          <div className="absolute left-3 top-3 rounded bg-red-500/20 px-3 py-2 text-sm text-red-200">
+  2373            {error}
+  2374          </div>
+  2375        )}
+  2376  
+  2377        {lastPrice != null && (
+  2378          <div className="absolute right-3 top-3 rounded bg-zinc-900/70 px-3 py-2 text-sm text-zinc-100">
+  2379            ?꾩옱媛: {lastPrice.toFixed(2)}
+  2380          </div>
+  2381        )}
+  2382  
+  2383        <div className="absolute left-3 bottom-16 z-50 pointer-events-auto">
+  2384          <button
+  2385            onClick={handleLoadMore}
+  2386            disabled={isLoadingMore}
+  2387            className="rounded bg-zinc-900/80 px-3 py-2 text-sm text-zinc-100 hover:bg-zinc-800 disabled:opacity-50"
+  2388          >
+  2389            {isLoadingMore ? "遺덈윭?ㅻ뒗 以?.." : "怨쇨굅 ??遺덈윭?ㅺ린"}
+  2390          </button>
+  2391        </div>
+  2392      </div>
+  2393    );
+  2394  }

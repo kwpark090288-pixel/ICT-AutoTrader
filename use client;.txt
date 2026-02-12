@@ -1177,17 +1177,22 @@ g.__CTX = {
 
     if (!side) continue;
 
-        // confirm index = i+1 close
-      const conf = i + 1;
-      if (conf >= n) continue;
+  // confirm index = i+1 close
+    const conf = i + 1;
+    if (conf >= n) continue;
+// =========================
+// F4) 컨텍스트/거리 (채널 우선, 없으면 추세선) + 방향 일치
+//  - bull FVG는 채널 up / 트렌드 up 컨텍스트만
+//  - bear FVG는 채널 down / 트렌드 down 컨텍스트만
+// =========================
+const confTime = candles4h[conf].time;                 // i+1 close 시점
+const atrConf = Number.isFinite(atr[conf]) ? atr[conf] : atrI;  // conf ATR (fallback: atrI)
 
-      const confTime = candles4h[conf].time; // i+1 close 시점
-      const atrConf = Number.isFinite(atr[conf]) ? atr[conf] : atrI; // conf ATR (fallback: atrI)
+// midPrice는 zone 중앙값
+const midPrice = (top + bottom) / 2;
 
-      // midPrice는 zone 중앙값
-      const midPrice = (top + bottom) / 2;
-
-      // NOTE: 컨텍스트(F4)는 아래 extra(F2/F3/F4) 계산에 포함. 여기서 강제 continue 금지.
+// 컨텍스트 거리 필터 (통과 못하면 스킵)
+// NOTE: 컨텍스트(F4)는 아래 extra(F2/F3/F4) 계산에 포함. 여기서 강제 continue 금지.
 
     // F1 displacement (필수)
     const b1 = Math.abs(cPrev.close - cPrev.open);
