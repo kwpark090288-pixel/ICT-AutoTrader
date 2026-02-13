@@ -9,6 +9,9 @@ import {
   type LogicalRange,
   type UTCTimestamp,
 } from "lightweight-charts";
+import type { Bar } from "../../lib/engine/types";
+import { intervalToTF, tfDurationMs } from "../../lib/engine/binance";
+import { getOrInitEngine } from "../../lib/engine/runtime";
 
 /* =========================
    Types
@@ -90,15 +93,15 @@ type Props = { symbol: string; tf: string };
 type WsKlineMsg = {
   e: "kline";
   k: {
-    t: number; // open time ms
-    o: string;
-    h: string;
-    l: string;
-    c: string;
-    x: boolean; // closed
-  };
+  t: number; // open time ms
+  T: number; // close time ms 
+  o: string;
+  h: string;
+  l: string;
+  c: string;
+  x: boolean; // closed
 };
-
+};
 type WsAggTradeMsg = {
   e: "aggTrade";
   p: string;
@@ -2236,6 +2239,29 @@ useEffect(() => {
         } else if (last.time === c.time) {
           arr[arr.length - 1] = c;
         }
+        // ===== Engine hook: ONLY on candle close =====
+        if (msg.k.x) {
+          const tfEnum = intervalToTF(interval);
+          // H4는 아래 ws4h에서 따로 처리하므로 여기서는 제외
+          if (tfEnum && tfEnum !== "H4") {
+            const openMs = msg.k.t;
+            const closeMs = msg.k.T ?? openMs + tfDurationMs(tfEnum);
+
+            const bar: Bar = {
+              tf: tfEnum,
+              openTime: openMs,
+              closeTime: closeMs,
+              open: c.open,
+              high: c.high,
+              low: c.low,
+              close: c.close,
+            };
+
+            const engine = getOrInitEngine(symbol);
+            const evs = engine.onBarClose(bar);
+            if (evs.length) console.log(evs.join("\n"));
+          }
+        }
 
         syncFromStore();
         updateRightScaleW();
@@ -2307,6 +2333,20 @@ useEffect(() => {
 
         if (msg.k.x) {
           // only on 4H close
+                    const bar: Bar = {
+            tf: "H4",
+            openTime: msg.k.t,
+            closeTime: msg.k.T ?? msg.k.t + tfDurationMs("H4"),
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+          };
+
+          const engine = getOrInitEngine(symbol);
+          const evs = engine.onBarClose(bar);
+          if (evs.length) console.log(evs.join("\n"));
+
           const prev = getOrInitH4(symbol);
           const nextChannel = updateLockedChannel(prev.channel, arr);
           const nextTrend = updateLockedTrendline(prev.trend, arr);
