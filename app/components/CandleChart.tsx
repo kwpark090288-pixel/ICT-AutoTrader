@@ -89,6 +89,10 @@ type H4Context = {
 };
 
 type Props = { symbol: string; tf: string };
+type WsCombinedStreamMsg = {
+  stream: string;
+  data: WsKlineMsg;
+};
 
 type WsKlineMsg = {
   e: "kline";
@@ -107,6 +111,12 @@ type WsAggTradeMsg = {
   p: string;
   T: number;
 };
+function klineIntervalFromStream(stream: string): string | null {
+  const token = "@kline_";
+  const idx = stream.indexOf(token);
+  if (idx === -1) return null;
+  return stream.slice(idx + token.length); // ex) "15m", "4h", "1d"
+}
 
 /* =========================
    Global in-memory store (persists across TF changes)
@@ -2239,30 +2249,7 @@ useEffect(() => {
         } else if (last.time === c.time) {
           arr[arr.length - 1] = c;
         }
-        // ===== Engine hook: ONLY on candle close =====
-        if (msg.k.x) {
-          const tfEnum = intervalToTF(interval);
-          // H4는 아래 ws4h에서 따로 처리하므로 여기서는 제외
-          if (tfEnum && tfEnum !== "H4") {
-            const openMs = msg.k.t;
-            const closeMs = msg.k.T ?? openMs + tfDurationMs(tfEnum);
-
-            const bar: Bar = {
-              tf: tfEnum,
-              openTime: openMs,
-              closeTime: closeMs,
-              open: c.open,
-              high: c.high,
-              low: c.low,
-              close: c.close,
-            };
-
-            const engine = getOrInitEngine(symbol);
-            const evs = engine.onBarClose(bar);
-            if (evs.length) console.log(evs.join("\n"));
-          }
-        }
-
+        
         syncFromStore();
         updateRightScaleW();
         scheduleDrawOverlay();
@@ -2333,19 +2320,7 @@ useEffect(() => {
 
         if (msg.k.x) {
           // only on 4H close
-                    const bar: Bar = {
-            tf: "H4",
-            openTime: msg.k.t,
-            closeTime: msg.k.T ?? msg.k.t + tfDurationMs("H4"),
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
-          };
-
-          const engine = getOrInitEngine(symbol);
-          const evs = engine.onBarClose(bar);
-          if (evs.length) console.log(evs.join("\n"));
+                   
 
           const prev = getOrInitH4(symbol);
           const nextChannel = updateLockedChannel(prev.channel, arr);
@@ -2387,6 +2362,67 @@ g.__CTX = {
       ws4hRef.current = null;
     };
   }, [scheduleDrawOverlay, symbol]);
+// ===== WS (ENGINE MultiTF feed: D1/H4/H1/M30/M15/M5) =====
+useEffect(() => {
+  const sym = symbol.toLowerCase();
+  const intervals = ["1d", "4h", "1h", "30m", "15m", "5m"]; // 엔진 스펙 TF 고정
+  const streams = intervals.map((iv) => `${sym}@kline_${iv}`).join("/");
+  const url = `wss://fstream.binance.com/stream?streams=${streams}`;
+
+  const ws = new WebSocket(url);
+  const engine = getOrInitEngine(symbol);
+
+  ws.onopen = () => {
+    console.log("[ENGINE_WS] open", url);
+  };
+
+  ws.onerror = (err) => {
+    console.error("[ENGINE_WS] error", err);
+  };
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data) as WsCombinedStreamMsg;
+
+    const interval = klineIntervalFromStream(msg.stream);
+    if (!interval) return;
+
+    const tfEnum = intervalToTF(interval);
+    if (!tfEnum) return;
+
+    const k = msg.data?.k;
+    if (!k?.x) return; // ✅ 마감봉에서만 onBarClose
+
+    const openP = Number(k.o);
+    const highP = Number(k.h);
+    const lowP = Number(k.l);
+    const closeP = Number(k.c);
+    if (![openP, highP, lowP, closeP].every(Number.isFinite)) return;
+
+    const openMs = k.t;
+    const closeMs = k.T ?? openMs + tfDurationMs(tfEnum);
+
+    const bar: Bar = {
+      tf: tfEnum,
+      openTime: openMs,
+      closeTime: closeMs,
+      open: openP,
+      high: highP,
+      low: lowP,
+      close: closeP,
+    };
+
+    const evs = engine.onBarClose(bar);
+    if (evs.length) console.log(evs.join("\n"));
+  };
+
+  ws.onclose = () => {
+    console.log("[ENGINE_WS] close");
+  };
+
+  return () => {
+    ws.close();
+  };
+}, [symbol]);
 
   // overlay rAF cleanup
   useEffect(() => {
