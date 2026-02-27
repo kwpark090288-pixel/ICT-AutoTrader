@@ -2362,67 +2362,7 @@ g.__CTX = {
       ws4hRef.current = null;
     };
   }, [scheduleDrawOverlay, symbol]);
-// ===== WS (ENGINE MultiTF feed: D1/H4/H1/M30/M15/M5) =====
-useEffect(() => {
-  const sym = symbol.toLowerCase();
-  const intervals = ["1d", "4h", "1h", "30m", "15m", "5m"]; // 엔진 스펙 TF 고정
-  const streams = intervals.map((iv) => `${sym}@kline_${iv}`).join("/");
-  const url = `wss://fstream.binance.com/stream?streams=${streams}`;
 
-  const ws = new WebSocket(url);
-  const engine = getOrInitEngine(symbol);
-
-  ws.onopen = () => {
-    console.log("[ENGINE_WS] open", url);
-  };
-
-  ws.onerror = (err) => {
-    console.error("[ENGINE_WS] error", err);
-  };
-
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data) as WsCombinedStreamMsg;
-
-    const interval = klineIntervalFromStream(msg.stream);
-    if (!interval) return;
-
-    const tfEnum = intervalToTF(interval);
-    if (!tfEnum) return;
-
-    const k = msg.data?.k;
-    if (!k?.x) return; // ✅ 마감봉에서만 onBarClose
-
-    const openP = Number(k.o);
-    const highP = Number(k.h);
-    const lowP = Number(k.l);
-    const closeP = Number(k.c);
-    if (![openP, highP, lowP, closeP].every(Number.isFinite)) return;
-
-    const openMs = k.t;
-    const closeMs = k.T ?? openMs + tfDurationMs(tfEnum);
-
-    const bar: Bar = {
-      tf: tfEnum,
-      openTime: openMs,
-      closeTime: closeMs,
-      open: openP,
-      high: highP,
-      low: lowP,
-      close: closeP,
-    };
-
-    const evs = engine.onBarClose(bar);
-    if (evs.length) console.log(evs.join("\n"));
-  };
-
-  ws.onclose = () => {
-    console.log("[ENGINE_WS] close");
-  };
-
-  return () => {
-    ws.close();
-  };
-}, [symbol]);
 
   // overlay rAF cleanup
   useEffect(() => {

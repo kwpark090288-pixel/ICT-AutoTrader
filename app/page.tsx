@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import CandleChart from "./components/CandleChart";
+import EngineRunner from "./components/EngineRunner";
 
 function clamp(n: number, min: number, max: number) {
   return Math.min(Math.max(n, min), max);
@@ -144,6 +145,7 @@ const maxLeft = Math.max(
 
             {/* ✅ 차트 */}
             <div className="rounded-lg border border-zinc-800 bg-zinc-950">
+              <EngineRunner symbol={symbol} />
               <CandleChart symbol={symbol} tf={selectedTf} />
             </div>
 
