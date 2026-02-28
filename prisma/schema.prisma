@@ -1,0 +1,112 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum TelegramOutboxStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+}
+
+enum TradePlanStatus {
+  OPEN
+  CLOSED
+}
+
+model TelegramOutbox {
+  id             String               @id @default(uuid())
+  idempotencyKey String               @unique @map("idempotency_key")
+  messageType    String               @map("message_type")
+  planId         String?              @map("plan_id")
+  symbol         String?
+  tf             String?
+  direction      String?
+  payloadText    String               @map("payload_text")
+  status         TelegramOutboxStatus @default(PENDING)
+  attemptCount   Int                  @default(0) @map("attempt_count")
+  nextAttemptAt  DateTime             @default(now()) @map("next_attempt_at")
+  createdAt      DateTime             @default(now()) @map("created_at")
+  sentAt         DateTime?            @map("sent_at")
+  lastError      String?              @map("last_error")
+  tgMessageId    String?              @map("tg_message_id")
+
+  @@index([status, nextAttemptAt])
+  @@map("telegram_outbox")
+}
+
+model TradePlan {
+  planId    String          @id @default(uuid()) @map("plan_id")
+  status    TradePlanStatus @default(OPEN)
+  symbol    String
+  tf        String?
+  direction String?
+  openedAt  DateTime        @default(now()) @map("opened_at")
+  closedAt  DateTime?       @map("closed_at")
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+
+  @@index([symbol, status, openedAt])
+  @@map("trade_plans")
+}
+
+model SignalEvent {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now()) @map("created_at")
+  symbol    String?
+  tf        String?
+  eventText String   @map("event_text")
+
+  @@index([createdAt])
+  @@index([symbol, tf, createdAt])
+  @@map("signals")
+}
+
+model SeenState {
+  id        String   @id @default(uuid())
+  profileId String   @map("profile_id")
+  eventId   String   @map("event_id")
+  seenAtUtc DateTime @map("seen_at_utc")
+
+  @@unique([profileId, eventId])
+  @@map("seen_state")
+}
+
+model MuteState {
+  id           String    @id @default(uuid())
+  profileId    String    @map("profile_id")
+  symbol       String
+  tf           String
+  direction    String?
+  muteUntilUtc DateTime? @map("mute_until_utc")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@unique([profileId, symbol, tf, direction])
+  @@map("mute_state")
+}
+
+model SystemState {
+  scopeKey    String   @id @map("scope_key") // use "GLOBAL"
+  syncing     Boolean  @default(true)
+  dataOk      Boolean  @default(false) @map("data_ok")
+  gapDetected Boolean  @default(false) @map("gap_detected")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  details     Json?    @map("details_json")
+
+  @@map("system_state")
+}
+
+model ReviewNote {
+  id        String   @id @default(uuid())
+  planId    String   @map("plan_id")
+  noteText  String   @map("note_text")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([planId, createdAt])
+  @@map("review_notes")
+}

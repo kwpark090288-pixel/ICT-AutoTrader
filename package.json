@@ -6,9 +6,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "telegram:smoke": "node scripts/telegram_smoke_test.js"
   },
   "dependencies": {
+    "@prisma/client": "^7.4.1",
     "lightweight-charts": "^4.2.2",
     "next": "16.1.1",
     "react": "19.2.3",
@@ -21,6 +23,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.1.1",
+    "prisma": "^7.4.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
