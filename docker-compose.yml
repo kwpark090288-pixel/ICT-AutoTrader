@@ -1,6 +1,8 @@
 ﻿services:
   postgres:
     image: postgres:16
+    container_name: trading-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: trader
       POSTGRES_PASSWORD: trader_pass
@@ -10,5 +12,41 @@
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  web:
+    image: node:20
+    container_name: trading-web
+    restart: unless-stopped
+    working_dir: /app
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader_pass@postgres:5432/trading_dashboard?schema=public
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+      - web_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0"
+
+  worker:
+    image: node:20
+    container_name: trading-worker
+    restart: unless-stopped
+    working_dir: /app
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://trader:trader_pass@postgres:5432/trading_dashboard?schema=public
+    volumes:
+      - .:/app
+      - worker_node_modules:/app/node_modules
+    command: sh -c "npm install && npm run worker:dev"
+
 volumes:
   pgdata:
+  web_node_modules:
+  worker_node_modules:
