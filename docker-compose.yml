@@ -28,7 +28,7 @@
     volumes:
       - .:/app
       - web_node_modules:/app/node_modules
-    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0"
+    command: sh -c "npm install && npm run dev -- --webpack --hostname 0.0.0.0"
 
   worker:
     image: node:20

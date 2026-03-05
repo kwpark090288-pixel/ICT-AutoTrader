@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "telegram:smoke": "node scripts/telegram_smoke_test.js",
-    "worker:dev": "tsx worker/main.ts"
+    "worker:dev": "tsx worker/main.ts",
+    "engine:exact": "tsx scripts/engine_exact_match.ts"
   },
   "dependencies": {
     "@prisma/client": "^7.4.1",
