@@ -1,36 +1,73 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Trading Web
 
-## Getting Started
+## Introduction
 
-First, run the development server:
+Trading Web is a Next.js-based trading dashboard and signal monitoring tool. It is designed to process market data, evaluate ICT-style trading conditions, display chart and alert information, and support automated signal routing workflows.
+
+The project includes a web dashboard, indicator engines, alert panels, policy checks, trade lifecycle modules, Telegram notification utilities, and a background worker process.
+
+## Key Features
+
+- Real-time trading dashboard built with Next.js and React
+- Candlestick chart UI powered by `lightweight-charts`
+- ICT-style signal logic for FVG, Order Block, Trendline, and Channel conditions
+- Policy layer for risk, regime, edge, cost, portfolio, and data-integrity checks
+- Trade lifecycle handling for open, monitor, close, review, and persistence flows
+- Alert and diagnostic panels for signal status and "why no open" analysis
+- Telegram notification and dispatch utilities
+- PostgreSQL and Prisma integration for data persistence
+- Worker process for always-on background market and signal handling
+
+## Usage
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Create an environment file from the example:
+
+```bash
+cp .env.example .env
+```
+
+Run the development server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open the dashboard:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```text
+http://localhost:3000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Run the background worker:
 
-## Learn More
+```bash
+npm run worker:dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+Run lint checks:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm run lint
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Build for production:
 
-## Deploy on Vercel
+```bash
+npm run build
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Start the production server:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+npm run start
+```
+
+## License
+
+MIT License
