@@ -7,20 +7,51 @@ import { createTrendlineIndicatorEngine } from "./indicators/trendline/engine";
 
 export type CompositeEngine = IndicatorEngine;
 
-export function createCompositeEngine(): CompositeEngine {
-  const fvg: IndicatorEngine = createFvgIndicatorEngine();
-  const ob: IndicatorEngine = createObIndicatorEngine();
-  const channel: IndicatorEngine = createChannelIndicatorEngine();
-  const trendline: IndicatorEngine = createTrendlineIndicatorEngine();
+export function runCompositeEngineBatch(
+  engines: readonly IndicatorEngine[],
+  bar: Bar
+): EngineEventBatch {
+  const phaseAEvents: string[] = [];
+  const phaseCEevents: string[] = [];
+  const supportsPhasedBatch = engines.every(
+    (engine) =>
+      typeof engine.onBarClosePhaseA === "function" &&
+      typeof engine.onBarClosePhaseC === "function" &&
+      typeof engine.publishRuntimeSnapshot === "function"
+  );
+
+  if (!supportsPhasedBatch) {
+    return engines.flatMap((engine) => engine.onBarClose(bar));
+  }
+
+  for (const engine of engines) {
+    phaseAEvents.push(...(engine.onBarClosePhaseA?.(bar) ?? []));
+  }
+
+  for (const engine of engines) {
+    engine.publishRuntimeSnapshot?.();
+  }
+
+  for (const engine of engines) {
+    phaseCEevents.push(...(engine.onBarClosePhaseC?.(bar) ?? []));
+  }
+
+  for (const engine of engines) {
+    engine.publishRuntimeSnapshot?.();
+  }
+
+  return [...phaseAEvents, ...phaseCEevents];
+}
+
+export function createCompositeEngine(symbol: string = "UNKNOWN"): CompositeEngine {
+  const fvg: IndicatorEngine = createFvgIndicatorEngine(symbol);
+  const channel: IndicatorEngine = createChannelIndicatorEngine(symbol);
+  const trendline: IndicatorEngine = createTrendlineIndicatorEngine(symbol);
+  const ob: IndicatorEngine = createObIndicatorEngine(symbol);
 
   return {
     onBarClose(bar: Bar): EngineEventBatch {
-      return [
-        ...fvg.onBarClose(bar),
-        ...ob.onBarClose(bar),
-        ...channel.onBarClose(bar),
-        ...trendline.onBarClose(bar),
-      ];
+      return runCompositeEngineBatch([fvg, channel, trendline, ob], bar);
     },
   };
 }

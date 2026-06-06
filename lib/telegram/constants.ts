@@ -1,0 +1,5 @@
+export const DEFAULT_TELEGRAM_REFERENCE_LEVERAGE = 20;
+
+export const TELEGRAM_OUTBOX_BATCH_LIMIT = 20;
+
+export const TELEGRAM_RETRY_DELAYS_MIN = [1, 5, 15] as const;

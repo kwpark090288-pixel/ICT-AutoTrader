@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -10,8 +10,27 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import type { Bar } from "../../lib/engine/types";
-import { intervalToTF, tfDurationMs } from "../../lib/engine/binance";
 import { getOrInitEngine } from "../../lib/engine/runtime";
+import {
+  fromBinanceInterval,
+  normalizeChartTimeframe,
+  toBinanceInterval,
+  tfToSeconds,
+  type ChartTimeframe,
+} from "@/lib/chart/timeframes";
+import {
+  notifyChartControllerUpdated,
+  registerChartController,
+  unregisterChartController,
+  type ChartController,
+  type ChartTradePlanLinesArgs,
+} from "@/lib/alerts/chart-controller";
+import { getAlertPoiHighlight } from "@/lib/alerts/poi-highlight";
+import type { StoredSignalPoiHighlight } from "@/lib/alerts/types";
+import {
+  linePriceAt,
+} from "@/lib/chart/h4-context";
+import { computeNextH4Context, createEmptyH4Context } from "@/lib/chart/h4-state";
 
 /* =========================
    Types
@@ -68,7 +87,7 @@ type ChannelState = {
   offset?: number; // p95 residual (>0)
   breakCount: number; // consecutive valid breaches (4H)
   anchorStartTime?: UTCTimestamp; // base.t1
-  why?: ChannelNoneWhy; // ✅ mode==="none"일 때 이유
+  why?: ChannelNoneWhy; // ??mode==="none"?????댁쑀
 };
 
 type TrendlineState = {
@@ -76,7 +95,7 @@ type TrendlineState = {
   line?: Line2P;
   breakCount: number;
   anchorStartTime?: UTCTimestamp;
-  why?: "mixed_or_range" | "anchor_fail"; // ✅ 추가
+  why?: "mixed_or_range" | "anchor_fail"; // ??異붽?
 };
 
 
@@ -111,21 +130,24 @@ type WsAggTradeMsg = {
   p: string;
   T: number;
 };
-function klineIntervalFromStream(stream: string): string | null {
+
+function chartTimeframeFromStream(
+  stream: string
+): ChartTimeframe | null {
   const token = "@kline_";
   const idx = stream.indexOf(token);
   if (idx === -1) return null;
-  return stream.slice(idx + token.length); // ex) "15m", "4h", "1d"
+  return fromBinanceInterval(stream.slice(idx + token.length));
 }
 
 /* =========================
    Global in-memory store (persists across TF changes)
 ========================= */
 const H4_STORE: Map<string, H4Context> = (() => {
-  // SSR 안전장치: 서버에서는 그냥 새 Map
+  // SSR ?덉쟾?μ튂: ?쒕쾭?먯꽌??洹몃깷 ??Map
   if (typeof window === "undefined") return new Map<string, H4Context>();
 
-  // 브라우저(dev)에서는 window에 붙여서 HMR에도 유지
+  // 釉뚮씪?곗?(dev)?먯꽌??window??遺숈뿬??HMR?먮룄 ?좎?
   const w = window as any;
   return w.__H4_STORE ?? (w.__H4_STORE = new Map<string, H4Context>());
 })();
@@ -134,12 +156,7 @@ const H4_STORE: Map<string, H4Context> = (() => {
 function getOrInitH4(symbol: string): H4Context {
   const prev = H4_STORE.get(symbol);
   if (prev) return prev;
-  const init: H4Context = {
-    channel: { mode: "none", breakCount: 0 },
-    trend: { mode: "none", breakCount: 0 },
-    zones: [],
-    last4hTime: undefined,
-  };
+  const init = createEmptyH4Context() as unknown as H4Context;
   H4_STORE.set(symbol, init);
   return init;
 }
@@ -164,19 +181,7 @@ function coordTimeToSec(t: any): UTCTimestamp | null {
   return null;
 }
 
-function tfToSeconds(tf: string): number {
-  const t = tf.toLowerCase();
-  if (t === "3m") return 3 * 60;
-  if (t === "5m") return 5 * 60;
-  if (t === "15m") return 15 * 60;
-  if (t === "30m") return 30 * 60;
-  if (t === "1h") return 60 * 60;
-  if (t === "2h") return 2 * 60 * 60;
-  if (t === "4h") return 4 * 60 * 60;
-  return 15 * 60;
-}
-
-const SEC_4H = tfToSeconds("4H");
+const SEC_4H = tfToSeconds("4h");
 function to4hCloseTime(t: UTCTimestamp): UTCTimestamp {
   return (Number(t) + SEC_4H) as UTCTimestamp;
 }
@@ -230,7 +235,7 @@ function drawDebugHUD(ctx: CanvasRenderingContext2D, symbol: string) {
   const trWhy = tr?.mode === "none" ? (tr?.why ?? "") : "";
 
   const lines: string[] = [
-    `CH: ${ch?.mode ?? "?"}${chWhy ? ` (${chWhy})` : ""}  off=${Number.isFinite(ch?.offset) ? ch.offset.toFixed(1) : "—"}`,
+    `CH: ${ch?.mode ?? "?"}${chWhy ? ` (${chWhy})` : ""}  off=${Number.isFinite(ch?.offset) ? ch.offset.toFixed(1) : "??"}`,
     `TR: ${tr?.mode ?? "?"}${trWhy ? ` (${trWhy})` : ""}`,
     `Z: active ${zActive} / all ${zones.length}`,
   ];
@@ -262,1114 +267,7 @@ function drawDebugHUD(ctx: CanvasRenderingContext2D, symbol: string) {
   ctx.restore();
 }
 
-const CONTEXT_ATR_MULT = 0.25;
-
-function passesContextDistance(
-  side: "bull" | "bear",
-  midPrice: number,
-  t: UTCTimestamp,
-
-  atrNow: number,
-  channel: ChannelState,
-  trend: TrendlineState,
-
-  // ✅ zone 상/하단(있으면 range 기준으로 dist 계산)
-  zoneTop?: number,
-  zoneBottom?: number
-) {
-  const distMax = atrNow * CONTEXT_ATR_MULT;
-
-  // ✅ zone range(없으면 midPrice를 1점 range로 취급)
-  const hasZone =
-    Number.isFinite(zoneTop ?? NaN) && Number.isFinite(zoneBottom ?? NaN);
-  const lo = hasZone ? Math.min(zoneTop as number, zoneBottom as number) : midPrice;
-  const hi = hasZone ? Math.max(zoneTop as number, zoneBottom as number) : midPrice;
-
-  // ✅ ref가 [lo, hi] 안이면 dist=0
-  const distToRange = (ref: number) => {
-    if (ref < lo) return lo - ref;
-    if (ref > hi) return ref - hi;
-    return 0;
-  };
-
-  const g: any = window as any;
-  if (!g.__CTX) g.__CTX = { calls: 0, pass: 0, fail: 0, reasons: {}, last: null };
-  const ctx = g.__CTX;
-
-  const mark = (ok: boolean, why: string, detail: any = {}) => {
-    const g: any = window as any;
-    const ctx = g.__CTX;
-    if (!ctx) return;
-
-    ctx.calls = (ctx.calls ?? 0) + 1;
-    if (ok) ctx.pass = (ctx.pass ?? 0) + 1;
-    else ctx.fail = (ctx.fail ?? 0) + 1;
-
-    ctx.reasons = ctx.reasons ?? {};
-    ctx.reasons[why] = (ctx.reasons[why] ?? 0) + 1;
-
-    ctx.last = { ok, why, ...detail };
-  };
-
-  // 1) 채널 있으면 채널 우선 + 방향 일치 강제
-  // ✅ base만 있어도 사용(upper/lower가 base로 계산되도록)
-  if (channel.mode !== "none" && channel.base) {
-    if (channel.mode === "up") {
-      if (side !== "bull") {
-        mark(false, "ch_dir_mismatch", { side, chMode: channel.mode, distMax, midPrice, lo, hi });
-        return false;
-      }
-      const ref = channelBoundaryPriceAt(channel, t, "lower"); // up 채널 lower = base
-      const dist = distToRange(ref);
-      const ok = dist <= distMax;
-      mark(ok, ok ? "ch_ok_lower" : "ch_too_far", {
-        ref, dist, distMax, midPrice, lo, hi, side, chMode: channel.mode
-      });
-      return ok;
-    }
-
-    if (channel.mode === "down") {
-      if (side !== "bear") {
-        mark(false, "ch_dir_mismatch", { side, chMode: channel.mode, distMax, midPrice, lo, hi });
-        return false;
-      }
-      const ref = channelBoundaryPriceAt(channel, t, "upper"); // down 채널 upper = base
-      const dist = distToRange(ref);
-      const ok = dist <= distMax;
-      mark(ok, ok ? "ch_ok_upper" : "ch_too_far", {
-        ref, dist, distMax, midPrice, lo, hi, side, chMode: channel.mode
-      });
-      return ok;
-    }
-  }
-
-    // 2) 채널 NONE이면 추세선 사용 + 방향 일치
-  if (trend.mode !== "none" && trend.line) {
-    if (trend.mode === "up") {
-      if (side !== "bull") {
-        mark(false, "tr_dir_mismatch", { side, trMode: trend.mode, distMax, midPrice, lo, hi });
-        return false;
-      }
-      const ref = linePriceAt(trend.line, t);
-      const dist = distToRange(ref);
-      const ok = dist <= distMax;
-      mark(ok, ok ? "tr_ok" : "tr_too_far", { ref, dist, distMax, midPrice, lo, hi, side, trMode: trend.mode });
-      return ok;
-    }
-
-    if (trend.mode === "down") {
-      if (side !== "bear") {
-        mark(false, "tr_dir_mismatch", { side, trMode: trend.mode, distMax, midPrice, lo, hi });
-        return false;
-      }
-      const ref = linePriceAt(trend.line, t);
-      const dist = distToRange(ref);
-      const ok = dist <= distMax;
-      mark(ok, ok ? "tr_ok" : "tr_too_far", { ref, dist, distMax, midPrice, lo, hi, side, trMode: trend.mode });
-      return ok;
-    }
-  }
-
-  // 3) 컨텍스트 없으면 실패
-  mark(false, "no_context", { distMax, midPrice, lo, hi });
-  return false;
-}
-
-
-
-function linePriceAt(line: Line2P, t: UTCTimestamp) {
-  const x1 = Number(line.t1);
-  const x2 = Number(line.t2);
-  if (x1 === x2) return line.p2;
-  const m = (line.p2 - line.p1) / (x2 - x1);
-  return line.p1 + m * (Number(t) - x1);
-}
-
-/* =========================
-   ATR / Swings
-========================= */
-function computeATR(candles: Candle[], period = 14): number[] {
-  const n = candles.length;
-  const atr = new Array<number>(n).fill(NaN);
-  if (n === 0) return atr;
-
-  const tr = new Array<number>(n).fill(0);
-  for (let i = 0; i < n; i++) {
-    const high = candles[i].high;
-    const low = candles[i].low;
-    if (i === 0) {
-      tr[i] = high - low;
-      continue;
-    }
-    const prevClose = candles[i - 1].close;
-    const v1 = high - low;
-    const v2 = Math.abs(high - prevClose);
-    const v3 = Math.abs(low - prevClose);
-    tr[i] = Math.max(v1, v2, v3);
-  }
-
-  if (n < period) return atr;
-
-  let sum = 0;
-  for (let i = 0; i < period; i++) sum += tr[i];
-
-  let prevAtr = sum / period;
-  atr[period - 1] = prevAtr;
-
-  for (let i = period; i < n; i++) {
-    prevAtr = (prevAtr * (period - 1) + tr[i]) / period;
-    atr[i] = prevAtr;
-  }
-  return atr;
-}
-
-function findSwingHighsLows(candles: Candle[], pivotLen = 3) {
-  const n = candles.length;
-  const swingHigh = new Array<boolean>(n).fill(false);
-  const swingLow = new Array<boolean>(n).fill(false);
-
-  for (let i = pivotLen; i < n - pivotLen; i++) {
-    let isHigh = true;
-    let isLow = true;
-
-    const ph = candles[i].high;
-    const pl = candles[i].low;
-
-    for (let j = i - pivotLen; j <= i + pivotLen; j++) {
-      if (j === i) continue;
-      if (candles[j].high >= ph) isHigh = false;
-      if (candles[j].low <= pl) isLow = false;
-      if (!isHigh && !isLow) break;
-    }
-
-    if (isHigh) swingHigh[i] = true;
-    if (isLow) swingLow[i] = true;
-  }
-
-  return { swingHigh, swingLow };
-}
-
-type PivotPoint = { idx: number; t: UTCTimestamp; p: number };
-
-/* =========================
-   4H Channel + Trendline (spec)
-========================= */
-const PIVOT_LEN = 3;
-const CHANNEL_LOOKBACK = 300;
-const TREND_LOOKBACK = 600;
-
-const CHANNEL_MIN_SWING_MULT = 0.25;
-const TREND_MIN_SWING_MULT = 0.5;
-
-const BREAK_ATR_MULT = 0.2;
-
-function pickHLPair(pivotLowsAsc: PivotPoint[], atrNow: number, minSwingMult: number) {
-  if (pivotLowsAsc.length < 2) return null;
-  const L2 = pivotLowsAsc[pivotLowsAsc.length - 1];
-  for (let k = pivotLowsAsc.length - 2; k >= 0; k--) {
-    const L1 = pivotLowsAsc[k];
-    if (!(L2.p > L1.p)) continue; // 동률 불허
-    if (L2.p - L1.p < atrNow * minSwingMult) continue;
-    return { L1, L2 };
-  }
-  return null;
-}
-
-function pickLHPair(pivotHighsAsc: PivotPoint[], atrNow: number, minSwingMult: number) {
-  if (pivotHighsAsc.length < 2) return null;
-  const H2 = pivotHighsAsc[pivotHighsAsc.length - 1];
-  for (let k = pivotHighsAsc.length - 2; k >= 0; k--) {
-    const H1 = pivotHighsAsc[k];
-    if (!(H2.p < H1.p)) continue; // 동률 불허
-    if (H1.p - H2.p < atrNow * minSwingMult) continue;
-    return { H1, H2 };
-  }
-  return null;
-}
-
-/**
- * buildChannelFromScratch
- * - 2-b 구조 필터: HH/HL => up만, LH/LL => down만, mixed => none
- * - 2-a residual 표본: base.t2 이후 pivot만 사용 (추천)
- * - residual res>0만
- * - 표본 <5면 NONE
- */
-function buildChannelFromScratch(candles4h: Candle[]): ChannelState {
-  (window as any).__CH_DBG = {
-    stage: "enter",
-    at: Date.now(),
-    candles: candles4h.length,
-  };
-
-  const dbgNone = (
-    why: "mixed_or_range" | "anchor_fail" | "residual_sample_lt_5",
-    detail = "",
-    extra: any = {}
-  ): ChannelState => {
-    (window as any).__CH_DBG = {
-      ...(window as any).__CH_DBG,
-      stage: "return_none",
-      why,
-      detail,
-      ...extra,
-    };
-    return { mode: "none", breakCount: 0, why };
-  };
-
-  const dbgOk = (st: ChannelState, extra: any = {}): ChannelState => {
-    (window as any).__CH_DBG = {
-      ...(window as any).__CH_DBG,
-      stage: "return_ok",
-      mode: st.mode,
-      offset: st.offset ?? null,
-      anchorStartTime: st.anchorStartTime ?? null,
-      ...extra,
-    };
-    return st;
-  };
-
-   const none = (
-    why: "mixed_or_range" | "anchor_fail" | "residual_sample_lt_5",
-    detail = "",
-    extra: any = {}
-  ) => dbgNone(why, detail, extra);
-
-
-
-  if (candles4h.length < CHANNEL_LOOKBACK + PIVOT_LEN * 2 + 20) {
-    return none("anchor_fail");
-  }
-
-  const atr = computeATR(candles4h, 14);
-  const atrNow = Number.isFinite(atr.at(-1) ?? NaN) ? (atr.at(-1) as number) : NaN;
-  if (!Number.isFinite(atrNow) || atrNow <= 0) return none("anchor_fail");
-
-  const startIdx = Math.max(0, candles4h.length - CHANNEL_LOOKBACK);
-  const slice = candles4h.slice(startIdx);
-  const { swingHigh, swingLow } = findSwingHighsLows(slice, PIVOT_LEN);
-
-  const pivotHighs: PivotPoint[] = [];
-  const pivotLows: PivotPoint[] = [];
-  for (let i = 0; i < slice.length; i++) {
-    if (swingHigh[i]) pivotHighs.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].high });
-    if (swingLow[i]) pivotLows.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].low });
-  }
-
-  // 2-b) 구조 필터
-  if (pivotHighs.length < 2 || pivotLows.length < 2) {
-    return none("anchor_fail");
-  }
-
-  const hPrev = pivotHighs[pivotHighs.length - 2].p;
-  const hLast = pivotHighs[pivotHighs.length - 1].p;
-  const lPrev = pivotLows[pivotLows.length - 2].p;
-  const lLast = pivotLows[pivotLows.length - 1].p;
-
-  const isUp = hLast > hPrev && lLast > lPrev;
-  const isDown = hLast < hPrev && lLast < lPrev;
-
-  if (!isUp && !isDown) {
-    return none("mixed_or_range");
-  }
-
-  // UP 채널
-  if (isUp) {
-    const upPair = pickHLPair(pivotLows, atrNow, CHANNEL_MIN_SWING_MULT);
-    if (!upPair) return none("anchor_fail");
-
-    const base: Line2P = { t1: upPair.L1.t, p1: upPair.L1.p, t2: upPair.L2.t, p2: upPair.L2.p };
-// ✅ base 검증: up 채널인데 low가 base를 너무 자주/크게 깨면 NONE
-{
-  const BREACH = atrNow * 0.2;      // 허용 이탈폭 (추천: ATR*0.2)
-  const RATIO_TH = 0.25;            // 허용 비율 (추천: 25%)
-  const MIN_N = 20;                // 표본 최소 캔들 수
-
-  let n = 0;
-  let bad = 0;
-
-  for (const c of slice) {
-    if (Number(c.time) < Number(base.t1)) continue; // anchorStartTime 이후만
-    const lp = linePriceAt(base, c.time);
-    const breach = lp - c.low;                      // up 채널: base 아래로 깨진 정도
-    n++;
-    if (breach >= BREACH) bad++;
-  }
-
-  if (n >= MIN_N && bad / n >= RATIO_TH) {
-    return none("anchor_fail");
-  }
-}
-
-   // 2-a) residual 표본 제한: max(base.t2, base.t1) 이후 pivotHigh만
-const cutoffT = Math.max(Number(base.t2), Number(base.t1));
-
-const residuals: number[] = [];
-for (const ph of pivotHighs) {
-  if (Number(ph.t) < cutoffT) continue;
-  const baseP = linePriceAt(base, ph.t);
-  const res = ph.p - baseP;
-  if (res > 0) residuals.push(res);
-}
-
-    const off = percentile95Positive(residuals);
-    if (off == null) {
-      (window as any).__CH_DBG = { why: "residual_sample_lt_5", count: residuals.length, side: "up" };
-      return none("residual_sample_lt_5");
-    }
-
-    
-      return dbgOk({
-  mode: "up",
-  base,
-  offset: off,
-  breakCount: 0,
-  anchorStartTime: base.t1,
-});
-
-  }
-
-  // DOWN 채널
-  const dnPair = pickLHPair(pivotHighs, atrNow, CHANNEL_MIN_SWING_MULT);
-  if (!dnPair) if (!dnPair) return none("anchor_fail");
-
-  const base: Line2P = { t1: dnPair.H1.t, p1: dnPair.H1.p, t2: dnPair.H2.t, p2: dnPair.H2.p };
-
-  // 2-a) residual 표본 제한: max(base.t2, base.t1) 이후 pivotLow만
-const cutoffT = Math.max(Number(base.t2), Number(base.t1));
-
-const residuals: number[] = [];
-for (const pl of pivotLows) {
-  if (Number(pl.t) < cutoffT) continue;
-  const baseP = linePriceAt(base, pl.t);
-  const res = baseP - pl.p;
-  if (res > 0) residuals.push(res);
-}
-
-
-  const off = percentile95Positive(residuals);
-  if (off == null) {
-    (window as any).__CH_DBG = { why: "residual_sample_lt_5", count: residuals.length, side: "down" };
-    return none("residual_sample_lt_5");
-  }
-
-  return {
-    mode: "down",
-    base,
-    offset: off,
-    breakCount: 0,
-    anchorStartTime: base.t1,
-  };
-}
-
-function updateLockedChannel(prev: ChannelState, candles4h: Candle[]): ChannelState {
-  // 채널 NONE이거나 파라미터 없으면: 매 4H close마다 재시도 OK
-  if (prev.mode === "none" || !prev.base || !prev.offset) {
-    return buildChannelFromScratch(candles4h);
-  }
-
-  const atr = computeATR(candles4h, 14);
-  const i = candles4h.length - 1;
-  if (i <= 0) return prev;
-
-  const atrNow = atr[i];
-  if (!Number.isFinite(atrNow) || atrNow <= 0) return prev;
-
-  const c = candles4h[i];
-  const lineP = linePriceAt(prev.base, c.time);
-  if (!Number.isFinite(lineP)) return prev;
-
-  const BREACH = atrNow * 0.2;
-
-  // up: 종가가 base(지지) 아래로 BREACH 이상 이탈
-  // down: 종가가 base(저항) 위로 BREACH 이상 이탈
-  const breach = prev.mode === "up" ? (lineP - c.close) : (c.close - lineP);
-  const validBreach = breach >= BREACH;
-
-  const newCount = validBreach ? (prev.breakCount ?? 0) + 1 : 0;
-
-  // ✅ 2연속이면 Break 확정 → 두 번째 봉 close에서 즉시 재생성
-  if (newCount >= 2) {
-    return buildChannelFromScratch(candles4h);
-  }
-
-  return { ...prev, breakCount: newCount };
-}
-
-
-/* =========================
-   Trendline (spec)
-========================= */
-function buildTrendlineFromScratch(
-  candles4h: Candle[],
-  keepIfRange: TrendlineState | null
-): TrendlineState {
-  if (candles4h.length < TREND_LOOKBACK + PIVOT_LEN * 2 + 20) {
-    return keepIfRange ?? { mode: "none", breakCount: 0 };
-  }
-
-  const atr = computeATR(candles4h, 14);
-  const atrNow = Number.isFinite(atr.at(-1) ?? NaN) ? (atr.at(-1) as number) : NaN;
-  if (!Number.isFinite(atrNow) || atrNow <= 0) {
-  (window as any).__TR_DBG = { stage: "atr_invalid", atrNow, len: candles4h.length, at: candles4h.at(-1)?.time };
-  return { mode: "none", breakCount: 0, why: "anchor_fail" };
-}
-
-
-  const startIdx = Math.max(0, candles4h.length - TREND_LOOKBACK);
-  const slice = candles4h.slice(startIdx);
-  const { swingHigh, swingLow } = findSwingHighsLows(slice, PIVOT_LEN);
-
-  const pivotHighs: PivotPoint[] = [];
-  const pivotLows: PivotPoint[] = [];
-  for (let i = 0; i < slice.length; i++) {
-    if (swingHigh[i]) pivotHighs.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].high });
-    if (swingLow[i]) pivotLows.push({ idx: startIdx + i, t: slice[i].time, p: slice[i].low });
-  }
-
-  // =========================
-// 2-b) 구조 필터로 채널 방향 강제
-// HH/HL => up만, LH/LL => down만, mixed => NONE
-// =========================
-if (pivotHighs.length < 2 || pivotLows.length < 2) {
-  (window as any).__TR_DBG = {
-    stage: "insufficient_pivots",
-    pivotHighs: pivotHighs.length,
-    pivotLows: pivotLows.length,
-    at: candles4h.at(-1)?.time,
-  };
-  return { mode: "none", breakCount: 0, why: "anchor_fail" };
-}
-
-
-const hPrev = Number(pivotHighs[pivotHighs.length - 2].p);
-const hLast = Number(pivotHighs[pivotHighs.length - 1].p);
-const lPrev = Number(pivotLows[pivotLows.length - 2].p);
-const lLast = Number(pivotLows[pivotLows.length - 1].p);
-
-const finite4 =
-  Number.isFinite(hPrev) &&
-  Number.isFinite(hLast) &&
-  Number.isFinite(lPrev) &&
-  Number.isFinite(lLast);
-
-const isUp = finite4 && hLast > hPrev && lLast > lPrev;
-const isDown = finite4 && hLast < hPrev && lLast < lPrev;
-
-const structExtra = {
-  hPrev,
-  hLast,
-  lPrev,
-  lLast,
-  isUp,
-  isDown,
-  at: candles4h.at(-1)?.time,
-};
-
-if (isUp && isDown) {
-  (window as any).__TR_DBG = {
-    stage: "mixed_or_range",
-    detail: "both true (unexpected)",
-    ...structExtra,
-  };
-  return keepIfRange ?? { mode: "none", breakCount: 0, why: "mixed_or_range" };
-}
-
-if (!isUp && !isDown) {
-  (window as any).__TR_DBG = {
-    stage: "mixed_or_range",
-    detail: `PH ${hPrev}→${hLast}, PL ${lPrev}→${lLast}`,
-    ...structExtra,
-  };
-  return keepIfRange ?? { mode: "none", breakCount: 0, why: "mixed_or_range" };
-}
-
-
-
-  if (isUp) {
-    const pair = pickHLPair(pivotLows, atrNow, TREND_MIN_SWING_MULT);
-    if (!pair) {
-  (window as any).__TR_DBG = { stage: "anchor_fail_up", at: candles4h.at(-1)?.time };
-  return { mode: "none", breakCount: 0, why: "anchor_fail" };
-}
-
-    const line: Line2P = { t1: pair.L1.t, p1: pair.L1.p, t2: pair.L2.t, p2: pair.L2.p };
-    return { mode: "up", line, breakCount: 0, anchorStartTime: line.t1 };
-  }
-
-  const pair = pickLHPair(pivotHighs, atrNow, TREND_MIN_SWING_MULT);
-  if (!pair) {
-  (window as any).__TR_DBG = { stage: "anchor_fail_down", at: candles4h.at(-1)?.time };
-  return { mode: "none", breakCount: 0, why: "anchor_fail" };
-}
-
-  const line: Line2P = { t1: pair.H1.t, p1: pair.H1.p, t2: pair.H2.t, p2: pair.H2.p };
-  return { mode: "down", line, breakCount: 0, anchorStartTime: line.t1 };
-}
-
-function updateLockedTrendline(prev: TrendlineState, candles4h: Candle[]): TrendlineState {
-  if (prev.mode === "none" || !prev.line) {
-    return buildTrendlineFromScratch(candles4h, prev.mode === "none" ? null : prev);
-  }
-
-  const atr = computeATR(candles4h, 14);
-  const i = candles4h.length - 1;
-  if (i <= 0) return prev;
-
-  const atrNow = atr[i];
-  if (!Number.isFinite(atrNow) || atrNow <= 0) return prev;
-
-  const c = candles4h[i];
-  const lineP = linePriceAt(prev.line, c.time);
-  if (!Number.isFinite(lineP)) return prev;
-
-  const BREACH = atrNow * 0.2;
-
-  // up: 종가가 선 아래로 BREACH 이상 이탈
-  // down: 종가가 선 위로 BREACH 이상 이탈
-  const breach = prev.mode === "up" ? (lineP - c.close) : (c.close - lineP);
-  const validBreach = breach >= BREACH;
-
-  const newCount = validBreach ? (prev.breakCount ?? 0) + 1 : 0;
-
-  // ✅ 2연속이면 Break 확정 → 즉시 재선정/재생성
-  if (newCount >= 2) {
-    return buildTrendlineFromScratch(candles4h, null);
-  }
-
-  return { ...prev, breakCount: newCount };
-}
-
-
-/* =========================
-   4H BOS/CHOCH + Sweep helpers (confirmed pivots only)
-========================= */
-type StructureSignals = {
-  bosUp: boolean[];
-  bosDown: boolean[];
-  chochUp: boolean[];
-  chochDown: boolean[];
-  sweepUp: boolean[]; // recovery close index
-  sweepDown: boolean[]; // recovery close index
-};
-
-function computeStructureSignals(candles4h: Candle[], atr: number[]): StructureSignals {
-  const n = candles4h.length;
-  const { swingHigh, swingLow } = findSwingHighsLows(candles4h, PIVOT_LEN);
-
-  const bosUp = new Array<boolean>(n).fill(false);
-  const bosDown = new Array<boolean>(n).fill(false);
-  const chochUp = new Array<boolean>(n).fill(false);
-  const chochDown = new Array<boolean>(n).fill(false);
-  const sweepUp = new Array<boolean>(n).fill(false);
-  const sweepDown = new Array<boolean>(n).fill(false);
-
-  const phList: PivotPoint[] = [];
-  const plList: PivotPoint[] = [];
-
-  let structureMode: "up" | "down" | "range" = "range";
-  let lastHL: PivotPoint | null = null;
-  let lastLH: PivotPoint | null = null;
-
-  let lastBosUpPivotIdx = -1;
-  let lastBosDownPivotIdx = -1;
-
-  for (let i = 0; i < n; i++) {
-    // confirm pivot at (i - PIVOT_LEN)
-    const p = i - PIVOT_LEN;
-    if (p >= 0) {
-      if (swingHigh[p]) phList.push({ idx: p, t: candles4h[p].time, p: candles4h[p].high });
-      if (swingLow[p]) plList.push({ idx: p, t: candles4h[p].time, p: candles4h[p].low });
-
-      if (phList.length >= 2 && plList.length >= 2) {
-        const hPrev = phList[phList.length - 2].p;
-        const hLast = phList[phList.length - 1].p;
-        const lPrev = plList[plList.length - 2].p;
-        const lLast = plList[plList.length - 1].p;
-
-        const isUp = hLast > hPrev && lLast > lPrev;
-        const isDown = hLast < hPrev && lLast < lPrev;
-
-        if (isUp) {
-          structureMode = "up";
-          // HL 갱신(진짜 higher low일 때만)
-          const prevPL = plList.length >= 2 ? plList[plList.length - 2] : null;
-          const curPL = plList[plList.length - 1];
-          if (prevPL && curPL.p > prevPL.p) lastHL = curPL;
-        } else if (isDown) {
-          structureMode = "down";
-          // LH 갱신(진짜 lower high일 때만)
-          const prevPH = phList.length >= 2 ? phList[phList.length - 2] : null;
-          const curPH = phList[phList.length - 1];
-          if (prevPH && curPH.p < prevPH.p) lastLH = curPH;
-        } else {
-          structureMode = "range";
-        }
-      }
-    }
-
-    const prevClose = i > 0 ? candles4h[i - 1].close : candles4h[i].close;
-
-    const lastPH = phList.length ? phList[phList.length - 1] : null;
-    const lastPL = plList.length ? plList[plList.length - 1] : null;
-
-    // BOS
-    if (lastPH && lastPH.idx > lastBosUpPivotIdx) {
-      if (prevClose <= lastPH.p && candles4h[i].close > lastPH.p) {
-        bosUp[i] = true;
-        lastBosUpPivotIdx = lastPH.idx;
-      }
-    }
-
-    if (lastPL && lastPL.idx > lastBosDownPivotIdx) {
-      if (prevClose >= lastPL.p && candles4h[i].close < lastPL.p) {
-        bosDown[i] = true;
-        lastBosDownPivotIdx = lastPL.idx;
-      }
-    }
-
-    // CHOCH
-    if (structureMode === "up" && lastHL) {
-      if (prevClose >= lastHL.p && candles4h[i].close < lastHL.p) chochDown[i] = true;
-    }
-    if (structureMode === "down" && lastLH) {
-      if (prevClose <= lastLH.p && candles4h[i].close > lastLH.p) chochUp[i] = true;
-    }
-
-    // Sweep -> Recovery (recovery close index = i)
-    if (i >= 1) {
-      const sweepBar = candles4h[i - 1];
-      const recBar = candles4h[i];
-      const a = Number.isFinite(atr[i - 1]) ? atr[i - 1] : 0;
-      const eqTol = a * 0.1;
-
-      const lastPH2 = phList.length >= 2 ? phList[phList.length - 2] : null;
-      const lastPH1 = phList.length >= 1 ? phList[phList.length - 1] : null;
-      const lastPL2 = plList.length >= 2 ? plList[plList.length - 2] : null;
-      const lastPL1 = plList.length >= 1 ? plList[plList.length - 1] : null;
-
-      let eqh: number | null = null;
-      if (lastPH2 && lastPH1 && Math.abs(lastPH1.p - lastPH2.p) <= eqTol) {
-        eqh = Math.max(lastPH1.p, lastPH2.p);
-      }
-
-      let eql: number | null = null;
-      if (lastPL2 && lastPL1 && Math.abs(lastPL1.p - lastPL2.p) <= eqTol) {
-        eql = Math.min(lastPL1.p, lastPL2.p);
-      }
-
-      // Up sweep + recovery close below
-      const upTargets: number[] = [];
-      if (eqh != null) upTargets.push(eqh);
-      if (lastPH1) upTargets.push(lastPH1.p);
-
-      for (const lvl of upTargets) {
-        if (sweepBar.high > lvl && recBar.close < lvl) {
-          sweepUp[i] = true;
-          break;
-        }
-      }
-
-      // Down sweep + recovery close above
-      const dnTargets: number[] = [];
-      if (eql != null) dnTargets.push(eql);
-      if (lastPL1) dnTargets.push(lastPL1.p);
-
-      for (const lvl of dnTargets) {
-        if (sweepBar.low < lvl && recBar.close > lvl) {
-          sweepDown[i] = true;
-          break;
-        }
-      }
-    }
-  }
-
-  return { bosUp, bosDown, chochUp, chochDown, sweepUp, sweepDown };
-}
-
-/* =========================
-   A+ OB (4H only) + A-grade FVG (4H only)
-========================= */
-const MAX_ZONES = 80;
-
-
-
-function computeAPlusOBAndAFVG(
-  candles4h: Candle[],
-  channel: ChannelState,
-  trend: TrendlineState
-): Zone[] {
-  const n = candles4h.length;
-  if (n < 120) return [];
-
-  const atr = computeATR(candles4h, 14);
-  const sig = computeStructureSignals(candles4h, atr);
-
-  const zones: Zone[] = [];
-// ===== DEBUG: reset CTX per compute run =====
-const g: any = window as any;
-g.__CTX = {
-  calls: 0,
-  pass: 0,
-  fail: 0,
-  reasons: {},
-  last: null,
-  ts: Date.now(),
-};
-
-
-  // ========= A+ OB =========
-  for (let k = 0; k < n; k++) {
-    const bullImpulse = sig.bosUp[k] || sig.chochUp[k];
-    const bearImpulse = sig.bosDown[k] || sig.chochDown[k];
-    if (!bullImpulse && !bearImpulse) continue;
-
-    const side: "bull" | "bear" = bullImpulse ? "bull" : "bear";
-    const atrK = Number.isFinite(atr[k]) ? atr[k] : NaN;
-    if (!Number.isFinite(atrK) || atrK <= 0) continue;
-
-    // displacement(3): max body > ATR*1.0 OR sum3 > ATR*1.8
-    const b0 = Math.max(0, k - 2);
-    let maxBody = 0;
-    let sumBody = 0;
-    for (let i = b0; i <= k; i++) {
-      const body = Math.abs(candles4h[i].close - candles4h[i].open);
-      maxBody = Math.max(maxBody, body);
-      sumBody += body;
-    }
-    const hasDisplacement = maxBody > atrK * 1.0 || sumBody > atrK * 1.8;
-    if (!hasDisplacement) continue;
-
-    // sweep->recovery required within [k-20..k]
-    const wStart = Math.max(0, k - 20);
-    let hasSweep = false;
-    for (let i = wStart; i <= k; i++) {
-      if (side === "bull" && sig.sweepDown[i]) {
-        hasSweep = true;
-        break;
-      }
-      if (side === "bear" && sig.sweepUp[i]) {
-        hasSweep = true;
-        break;
-      }
-    }
-    if (!hasSweep) continue;
-
-    // find OB candle: last opposite color in [k-20..k], prefer inside [k-3..k]
-    const impulseStart = Math.max(0, k - 3);
-    let obIdx: number | null = null;
-    let obIdxFallback: number | null = null;
-
-    for (let j = k; j >= wStart; j--) {
-      const c = candles4h[j];
-      const isOpp = side === "bull" ? c.close < c.open : c.close > c.open;
-      if (!isOpp) continue;
-
-      if (j >= impulseStart) {
-        obIdx = j;
-        break;
-      }
-      if (obIdxFallback == null) obIdxFallback = j;
-    }
-
-    if (obIdx == null) obIdx = obIdxFallback;
-    if (obIdx == null) continue;
-
-    const ob = candles4h[obIdx];
-
-    // doji 기본 제외(|c-o|>=0.1*ATR), 예외는 (구조+변위+스윕) 만족 시 허용 => 지금 이미 다 만족했으니 통과
-    // 단, 너무 심한 노이즈 줄이고 싶으면 여기서 continue 걸어도 됨.
-
-    // OB zone: bull open~low, bear open~high
-    const top = side === "bull" ? ob.open : ob.high;
-    const bottom = side === "bull" ? ob.low : ob.open;
-
-    const mid = (top + bottom) / 2;
-
-    // 컨텍스트/거리 + 방향 일치 필수
-    if (!passesContextDistance(side, mid, ob.time, atrK, channel, trend, top, bottom)) continue;
-
-    // invalidate simulation: break 2연속 OR touch>=3(침투>=ATR*0.1, 재진입만 카운트)
-    let touchCount = 0;
-    let invBreakCount = 0;
-    let active = true;
-    let invalidReason: ZoneInvalidReason | undefined = undefined;
-    let endTime: UTCTimestamp | undefined = undefined;
-
-    let inTouch = false;
-
-    for (let i = obIdx + 1; i < n; i++) {
-      const c = candles4h[i];
-      const ai = Number.isFinite(atr[i]) ? atr[i] : atrK;
-      if (!Number.isFinite(ai) || ai <= 0) continue;
-
-      // break invalidation
-      if (side === "bull") {
-        const breach = bottom - c.close;
-        const validBreach = c.close < bottom && breach >= ai * BREAK_ATR_MULT;
-        invBreakCount = validBreach ? invBreakCount + 1 : 0;
-        if (invBreakCount >= 2) {
-          active = false;
-          invalidReason = "break";
-          endTime = to4hCloseTime(c.time);
-          break;
-        }
-      } else {
-        const breach = c.close - top;
-        const validBreach = c.close > top && breach >= ai * BREAK_ATR_MULT;
-        invBreakCount = validBreach ? invBreakCount + 1 : 0;
-        if (invBreakCount >= 2) {
-          active = false;
-          invalidReason = "break";
-          endTime = to4hCloseTime(c.time);
-          break;
-        }
-      }
-
-      // touches (재진입만 카운트)
-      const overlaps = c.low <= top && c.high >= bottom;
-      if (!overlaps) {
-        inTouch = false;
-        continue;
-      }
-
-      const penetration =
-        side === "bull"
-          ? top - Math.min(c.low, top)
-          : Math.max(c.high, bottom) - bottom;
-
-      const isRealTouch = penetration >= ai * 0.1;
-
-      if (isRealTouch && !inTouch) {
-        touchCount++;
-        inTouch = true;
-        if (touchCount >= 3) {
-          active = false;
-          invalidReason = "touches";
-          endTime = to4hCloseTime(c.time);
-          break;
-        }
-      }
-    }
-
-    zones.push({
-      kind: "OB",
-      side,
-      top,
-      bottom,
-      startTime: ob.time,
-      endTime,
-      active,
-      invalidReason,
-      touchCount,
-    });
-  }
-
-  // ========= A-grade FVG =========
-  for (let i = 1; i < n - 1; i++) {
-    const cPrev = candles4h[i - 1];
-    const cMid = candles4h[i];
-    const cNext = candles4h[i + 1];
-
-    const atrI = Number.isFinite(atr[i]) ? atr[i] : NaN;
-    if (!Number.isFinite(atrI) || atrI <= 0) continue;
-
-    // 3-candle wick FVG
-    let side: "bull" | "bear" | null = null;
-    let top = 0;
-    let bottom = 0;
-
-    if (cPrev.high < cNext.low) {
-      side = "bull";
-      bottom = cPrev.high;
-      top = cNext.low;
-    } else if (cPrev.low > cNext.high) {
-      side = "bear";
-      bottom = cNext.high;
-      top = cPrev.low;
-    }
-
-    if (!side) continue;
-
-        // confirm index = i+1 close
-      const conf = i + 1;
-      if (conf >= n) continue;
-
-      const confTime = candles4h[conf].time; // i+1 close 시점
-      const atrConf = Number.isFinite(atr[conf]) ? atr[conf] : atrI; // conf ATR (fallback: atrI)
-
-      // midPrice는 zone 중앙값
-      const midPrice = (top + bottom) / 2;
-
-      // NOTE: 컨텍스트(F4)는 아래 extra(F2/F3/F4) 계산에 포함. 여기서 강제 continue 금지.
-
-    // F1 displacement (필수)
-    const b1 = Math.abs(cPrev.close - cPrev.open);
-    const b2 = Math.abs(cMid.close - cMid.open);
-    const b3 = Math.abs(cNext.close - cNext.open);
-    const maxBody = Math.max(b1, b2, b3);
-    const sumBody = b1 + b2 + b3;
-    const F1 = maxBody > atrI * 1.0 || sumBody > atrI * 1.8;
-    if (!F1) continue;
-
-    const w0 = Math.max(0, conf - 3);
-    const w1 = Math.min(n - 1, conf + 3);
-
-    // F2: ±3에 BOS/CHOCH same dir
-    let F2 = false;
-    for (let k = w0; k <= w1; k++) {
-      if (side === "bull" && (sig.bosUp[k] || sig.chochUp[k])) {
-        F2 = true;
-        break;
-      }
-      if (side === "bear" && (sig.bosDown[k] || sig.chochDown[k])) {
-        F2 = true;
-        break;
-      }
-    }
-
-    // F3: sweep->recovery (bull: sweepDown, bear: sweepUp) within ±3
-    let F3 = false;
-    for (let k = w0; k <= w1; k++) {
-      if (side === "bull" && sig.sweepDown[k]) {
-        F3 = true;
-        break;
-      }
-      if (side === "bear" && sig.sweepUp[k]) {
-        F3 = true;
-        break;
-      }
-    }
-
-    // F4: context distance + direction
-    const F4 = passesContextDistance(side, midPrice, confTime, atrConf, channel, trend, top, bottom);
-
-    const extra = (F2 ? 1 : 0) + (F3 ? 1 : 0) + (F4 ? 1 : 0);
-    if (extra < 2) continue;
-
-    // invalidate simulation:
-    // - full fill 1회(즉시)
-    // - opposite CHOCH
-    // - touch>=3 (재진입 카운트)
-    let touchCount = 0;
-    let active = true;
-    let invalidReason: ZoneInvalidReason | undefined = undefined;
-    let endTime: UTCTimestamp | undefined = undefined;
-    let inTouch = false;
-
-    for (let j = conf + 1; j < n; j++) {
-      const c = candles4h[j];
-      const aj = Number.isFinite(atr[j]) ? atr[j] : atrI;
-
-      // full fill (wick 기준)
-      const fullFilled =
-        side === "bull"
-          ? c.low <= bottom // bull: bottom까지 완전 메움
-          : c.high >= top;  // bear: top까지 완전 메움
-
-      if (fullFilled) {
-        active = false;
-        invalidReason = "fullfill";
-        endTime = to4hCloseTime(c.time);
-        break;
-      }
-
-      // opposite CHOCH (종가 기준)
-      if (side === "bull" && sig.chochDown[j]) {
-        active = false;
-        invalidReason = "choch";
-        endTime = to4hCloseTime(c.time);
-        break;
-      }
-      if (side === "bear" && sig.chochUp[j]) {
-        active = false;
-        invalidReason = "choch";
-        endTime = to4hCloseTime(c.time);
-        break;
-      }
-
-      // touch>=3 (wick 기준 + 재진입)
-      const overlaps = c.low <= top && c.high >= bottom;
-      if (!overlaps) {
-        inTouch = false;
-        continue;
-      }
-
-      // penetration(진짜 터치 강도는 간단히 zone 내부 진입으로 처리)
-      // 원하면 여기서 ai*0.1 같은 최소 침투를 추가 가능
-      if (!inTouch) {
-        touchCount++;
-        inTouch = true;
-        if (touchCount >= 3) {
-          active = false;
-          invalidReason = "touches";
-          endTime = to4hCloseTime(c.time);
-          break;
-        }
-      }
-    }
-
-    zones.push({
-      kind: "FVG",
-      side,
-      top,
-      bottom,
-      startTime: cMid.time,
-      endTime,
-      active,
-      invalidReason,
-      touchCount,
-    });
-  }
-
-  zones.sort((a, b) => Number(a.startTime) - Number(b.startTime));
-
-  function dedupeZones(zs: Zone[]) {
-    const m = new Map<string, Zone>();
-    for (const z of zs) {
-      const key =
-        `${z.kind}|${z.side}|${z.startTime}|` +
-        `${Math.round(z.top * 100)}|${Math.round(z.bottom * 100)}`;
-
-      const prev = m.get(key);
-      if (!prev) m.set(key, z);
-      else {
-        if (!prev.active && z.active) m.set(key, z);
-      }
-    }
-    return Array.from(m.values());
-  }
-
-  const deduped = dedupeZones(zones);
-  return deduped.length > MAX_ZONES ? deduped.slice(deduped.length - MAX_ZONES) : deduped;
-}
-
-/* =========================
-   Binance fetch (pagination)
-========================= */
-function toBinanceInterval(tf: string) {
-  switch (tf) {
-    case "3m":
-      return "3m";
-    case "5m":
-      return "5m";
-    case "15m":
-      return "15m";
-    case "30m":
-      return "30m";
-    case "1H":
-    case "1h":
-      return "1h";
-    case "2H":
-    case "2h":
-      return "2h";
-    case "4H":
-    case "4h":
-      return "4h";
-    default:
-      return "15m";
-  }
-}
-
+/* =========================`n   Binance fetch (pagination)`n========================= */
 const BINANCE_KLINES_MAX_LIMIT = 1500;
 const MAX_CANDLES_IN_MEMORY = 3000;
 
@@ -1431,10 +329,10 @@ async function fetchBinanceKlinesPaginated(params: {
       limit: pageSize,
       endTimeMs,
     });
-// D) 다음 페이지(더 과거)로 이동하기 위해 endTimeMs 갱신
+// D) ?ㅼ쓬 ?섏씠吏(??怨쇨굅)濡??대룞?섍린 ?꾪빐 endTimeMs 媛깆떊
 if (!batch || batch.length === 0) break;
 
-// Binance klines는 보통 시간 오름차순으로 오므로 batch[0]이 "가장 과거" 캔들
+// Binance klines??蹂댄넻 ?쒓컙 ?ㅻ쫫李⑥닚?쇰줈 ?ㅻ?濡?batch[0]??"媛??怨쇨굅" 罹붾뱾
 endTimeMs = Number(batch[0].time) * 1000 - 1;
 if (byTime.size >= targetCount) break;
 
@@ -1507,7 +405,10 @@ async function fetchMoreHistory(params: {
    Component
 ========================= */
 export default function CandleChart({ symbol, tf }: Props) {
-  const interval = useMemo(() => toBinanceInterval(tf), [tf]);
+  const normalizedTf = useMemo<ChartTimeframe>(() => {
+    return normalizeChartTimeframe(tf);
+  }, [tf]);
+  const interval = useMemo(() => toBinanceInterval(normalizedTf), [normalizedTf]);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -1527,6 +428,10 @@ export default function CandleChart({ symbol, tf }: Props) {
   const zonesRef = useRef<Zone[]>([]);
   const channelRef = useRef<ChannelState>({ mode: "none", breakCount: 0 });
   const trendRef = useRef<TrendlineState>({ mode: "none", breakCount: 0 });
+  const planLinesRef = useRef<(ChartTradePlanLinesArgs & { expiresAt: number }) | null>(null);
+  const planLinesTimeoutRef = useRef<number | null>(null);
+  const highlightedPoiRef = useRef<(StoredSignalPoiHighlight & { expiresAt: number }) | null>(null);
+  const highlightedPoiTimeoutRef = useRef<number | null>(null);
 
   const wsKlineRef = useRef<WebSocket | null>(null);
   const wsTradeRef = useRef<WebSocket | null>(null);
@@ -1544,9 +449,9 @@ export default function CandleChart({ symbol, tf }: Props) {
   const BINANCE_PAGE_LIMIT = 1500;
 const BINANCE_MAX_PAGES = 10;
 
-const LTF_TARGET_CANDLES = 2000; // 초기 로드
-const LTF_MAX_CANDLES = 3000;    // 메모리 최대
-const LTF_LOAD_MORE_STEP = 1500; // 더 불러오기 1회 최대치
+const LTF_TARGET_CANDLES = 2000; // 珥덇린 濡쒕뱶
+const LTF_MAX_CANDLES = 3000;    // 硫붾え由?理쒕?
+const LTF_LOAD_MORE_STEP = 1500; // ??遺덈윭?ㅺ린 1??理쒕?移?
 
   const TRENDLINE_STROKE = "rgba(59,130,246,0.90)";
   const SHOW_INACTIVE_ZONES = true;
@@ -1566,13 +471,42 @@ const LTF_LOAD_MORE_STEP = 1500; // 더 불러오기 1회 최대치
     trendRef.current = ctx.trend;
   }
 
+  const goToTime = useCallback((centerTime: string, barsAround: number) => {
+    const chart = chartRef.current;
+    const candles = candlesRef.current;
+    if (!chart || candles.length === 0) {
+      return;
+    }
+
+    const centerSec = Math.floor(Date.parse(centerTime) / 1000);
+    if (!Number.isFinite(centerSec)) {
+      return;
+    }
+
+    let nearestIndex = 0;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    candles.forEach((candle, index) => {
+      const distance = Math.abs(Number(candle.time) - centerSec);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestIndex = index;
+      }
+    });
+
+    chart.timeScale().setVisibleLogicalRange({
+      from: nearestIndex - barsAround,
+      to: nearestIndex + barsAround,
+    });
+  }, []);
+
   // ===== drawOverlay =====
   function drawDebugHUD(ctx: CanvasRenderingContext2D) {
   const g: any = window as any;
 
   const ch = g.__CH_DBG;
   const tr = g.__TR_DBG;
-  const z  = g.__Z_DBG; // 있으면 사용(없으면 안 나옴)
+  const z  = g.__Z_DBG; // ?덉쑝硫??ъ슜(?놁쑝硫????섏샂)
   const ctxDbg = g.__CTX;
 
 
@@ -1641,7 +575,7 @@ if (z) ctx.fillText(fmt("Z", z), 8, y); y += 14;
       const ltfLastTime = candlesRef.current.at(-1)?.time;
       const ltfFirstTime = candlesRef.current[0]?.time;
 
-      const forwardSec = MAX_FORWARD_BARS * SEC_4H; // ✅ ALWAYS 4H 기준 (스펙 고정)
+      const forwardSec = MAX_FORWARD_BARS * SEC_4H; // ??ALWAYS 4H 湲곗? (?ㅽ럺 怨좎젙)
 
       function clampTimeToLtf(t: UTCTimestamp): UTCTimestamp {
         let v = Number(t);
@@ -1737,7 +671,7 @@ if (z) ctx.fillText(fmt("Z", z), 8, y); y += 14;
       // ========== 2) Boxes ==========
       const zones = zonesRef.current ?? [];
       const inactiveAll = zones.filter((z) => !z.active);
-      const inactive = inactiveAll.slice(Math.max(0, inactiveAll.length - 20)); // 비활성 20개만
+      const inactive = inactiveAll.slice(Math.max(0, inactiveAll.length - 20)); // 鍮꾪솢??20媛쒕쭔
       const activeFVG = zones.filter((z) => z.active && z.kind === "FVG");
       const activeOB = zones.filter((z) => z.active && z.kind === "OB");
 
@@ -1944,11 +878,149 @@ if (z) ctx.fillText(fmt("Z", z), 8, y); y += 14;
           }
         }
       }
+
+      const planLines = planLinesRef.current;
+      if (planLines) {
+        if (Date.now() >= planLines.expiresAt) {
+          planLinesRef.current = null;
+        } else {
+          const lines = [
+            {
+              price: planLines.entryRefPrice,
+              label: "ENTRY",
+              color: "rgba(59,130,246,0.95)",
+            },
+            {
+              price: planLines.stopPrice,
+              label: "STOP",
+              color: "rgba(239,68,68,0.95)",
+            },
+            {
+              price: planLines.tpPrice,
+              label: "TP",
+              color: "rgba(34,197,94,0.95)",
+            },
+          ];
+
+          ctx.font = "12px sans-serif";
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([8, 6]);
+
+          for (const line of lines) {
+            const y = safePriceToY(line.price);
+            if (y == null) {
+              continue;
+            }
+
+            ctx.strokeStyle = line.color;
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(plotRightEdge, y);
+            ctx.stroke();
+
+            const labelX = Math.max(8, plotRightEdge - 92);
+            const labelY = Math.max(14, y - 8);
+            ctx.fillStyle = "rgba(0,0,0,0.55)";
+            ctx.fillRect(labelX - 6, labelY - 10, 82, 18);
+            ctx.fillStyle = line.color;
+            ctx.fillText(`${line.label} ${line.price.toFixed(4)}`, labelX, labelY + 2);
+          }
+
+          ctx.setLineDash([]);
+        }
+      }
+
+      const highlightedPoi = highlightedPoiRef.current;
+      if (highlightedPoi) {
+        if (Date.now() >= highlightedPoi.expiresAt) {
+          highlightedPoiRef.current = null;
+        } else if (highlightedPoi.kind === "TRENDLINE") {
+          const tL = clampTimeToLtf(
+            (tVisLeft ?? highlightedPoi.line.t1) as UTCTimestamp
+          );
+          const tR = clampTimeToLtf(
+            (tVisRight ?? highlightedPoi.line.t2) as UTCTimestamp
+          );
+          const xL = safeTimeToX(tL) ?? 0;
+          const xR = safeTimeToX(tR) ?? plotRightEdge;
+          const pL = linePriceAt(highlightedPoi.line, tL);
+          const pR = linePriceAt(highlightedPoi.line, tR);
+          const yL = safePriceToY(pL);
+          const yR = safePriceToY(pR);
+
+          if (yL != null && yR != null) {
+            ctx.save();
+            ctx.strokeStyle = "rgba(250,204,21,0.98)";
+            ctx.shadowColor = "rgba(250,204,21,0.55)";
+            ctx.shadowBlur = 10;
+            ctx.lineWidth = 3.5;
+            ctx.beginPath();
+            ctx.moveTo(xL, yL);
+            ctx.lineTo(xR, yR);
+            ctx.stroke();
+            ctx.restore();
+          }
+        } else if (highlightedPoi.kind === "CHANNEL") {
+          const tL = clampTimeToLtf(
+            (tVisLeft ?? highlightedPoi.base.t1) as UTCTimestamp
+          );
+          const tR = clampTimeToLtf(
+            (tVisRight ?? highlightedPoi.base.t2) as UTCTimestamp
+          );
+          const xL = safeTimeToX(tL) ?? 0;
+          const xR = safeTimeToX(tR) ?? plotRightEdge;
+          const baseLP = linePriceAt(highlightedPoi.base, tL);
+          const baseRP = linePriceAt(highlightedPoi.base, tR);
+          const parLP =
+            highlightedPoi.mode === "up"
+              ? baseLP + highlightedPoi.offset
+              : baseLP - highlightedPoi.offset;
+          const parRP =
+            highlightedPoi.mode === "up"
+              ? baseRP + highlightedPoi.offset
+              : baseRP - highlightedPoi.offset;
+          const yBaseL = safePriceToY(baseLP);
+          const yBaseR = safePriceToY(baseRP);
+          const yParL = safePriceToY(parLP);
+          const yParR = safePriceToY(parRP);
+
+          if (
+            yBaseL != null &&
+            yBaseR != null &&
+            yParL != null &&
+            yParR != null
+          ) {
+            ctx.save();
+            ctx.fillStyle = "rgba(250,204,21,0.10)";
+            ctx.beginPath();
+            ctx.moveTo(xL, yBaseL);
+            ctx.lineTo(xR, yBaseR);
+            ctx.lineTo(xR, yParR);
+            ctx.lineTo(xL, yParL);
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.strokeStyle = "rgba(250,204,21,0.98)";
+            ctx.shadowColor = "rgba(250,204,21,0.45)";
+            ctx.shadowBlur = 10;
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(xL, yBaseL);
+            ctx.lineTo(xR, yBaseR);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(xL, yParL);
+            ctx.lineTo(xR, yParR);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+      }
     } finally {
       if (DEBUG_HUD) drawDebugHUD(ctx);
       ctx.restore();
     }
-  }, [MAX_FORWARD_BARS, SHOW_INACTIVE_LABELS, SHOW_INACTIVE_ZONES, TRENDLINE_STROKE, tf, updateRightScaleW]);
+  }, [MAX_FORWARD_BARS, SHOW_INACTIVE_LABELS, SHOW_INACTIVE_ZONES, TRENDLINE_STROKE, normalizedTf, updateRightScaleW]);
 
   const scheduleDrawOverlay = useCallback(() => {
     if (overlayRafRef.current != null) return;
@@ -1957,6 +1029,68 @@ if (z) ctx.fillText(fmt("Z", z), 8, y); y += 14;
       drawOverlay();
     });
   }, [drawOverlay]);
+
+  const showTradePlanLines = useCallback((args: ChartTradePlanLinesArgs) => {
+    planLinesRef.current = {
+      ...args,
+      expiresAt: Date.now() + args.durationMs,
+    };
+
+    if (planLinesTimeoutRef.current != null) {
+      window.clearTimeout(planLinesTimeoutRef.current);
+    }
+
+    planLinesTimeoutRef.current = window.setTimeout(() => {
+      planLinesRef.current = null;
+      planLinesTimeoutRef.current = null;
+      scheduleDrawOverlay();
+    }, args.durationMs);
+
+    scheduleDrawOverlay();
+  }, [scheduleDrawOverlay]);
+
+  const highlightPOI = useCallback((poiRef: string, durationMs: number) => {
+    const poiHighlight = getAlertPoiHighlight(poiRef);
+    if (!poiHighlight) {
+      return false;
+    }
+
+    highlightedPoiRef.current = {
+      ...poiHighlight,
+      expiresAt: Date.now() + durationMs,
+    };
+
+    if (highlightedPoiTimeoutRef.current != null) {
+      window.clearTimeout(highlightedPoiTimeoutRef.current);
+    }
+
+    highlightedPoiTimeoutRef.current = window.setTimeout(() => {
+      highlightedPoiRef.current = null;
+      highlightedPoiTimeoutRef.current = null;
+      scheduleDrawOverlay();
+    }, durationMs);
+
+    scheduleDrawOverlay();
+    return true;
+  }, [scheduleDrawOverlay]);
+
+  useEffect(() => {
+    const controller: ChartController = {
+      symbol,
+      tf: normalizedTf,
+      isReady: () => {
+        return chartRef.current != null && seriesRef.current != null && candlesRef.current.length > 0;
+      },
+      goToTime,
+      showTradePlanLines,
+      highlightPOI,
+    };
+
+    registerChartController(controller);
+    return () => {
+      unregisterChartController(controller);
+    };
+  }, [goToTime, highlightPOI, normalizedTf, showTradePlanLines, symbol]);
 
   // ===== Load more (LTF only) =====
   const handleLoadMore = useCallback(async () => {
@@ -1995,6 +1129,7 @@ if (need <= 0) return;
 
       series.setData(merged);
       candlesRef.current = merged;
+      notifyChartControllerUpdated();
 
       const delta = merged.length - prevLen;
       if (beforeRange && delta > 0) {
@@ -2008,7 +1143,7 @@ if (need <= 0) return;
       updateRightScaleW();
       scheduleDrawOverlay();
     } catch (e: any) {
-      setError(e?.message ?? "과거 데이터 로드 실패");
+      setError(e?.message ?? "怨쇨굅 ?곗씠??濡쒕뱶 ?ㅽ뙣");
     } finally {
       isLoadingMoreRef.current = false;
       setIsLoadingMore(false);
@@ -2087,6 +1222,7 @@ useEffect(() => {
 
     chartRef.current = chart;
     seriesRef.current = series;
+    notifyChartControllerUpdated();
 
     updateRightScaleW();
 
@@ -2150,6 +1286,7 @@ useEffect(() => {
         series.setData(data);
         candlesRef.current = data;
         setLastPrice(data.at(-1)?.close ?? null);
+        notifyChartControllerUpdated();
 
         chart.timeScale().fitContent();
 
@@ -2158,7 +1295,7 @@ useEffect(() => {
         scheduleDrawOverlay();
       } catch (e: any) {
         if (cancelled) return;
-        setError(e?.message ?? "데이터 로드 실패");
+        setError(e?.message ?? "?곗씠??濡쒕뱶 ?ㅽ뙣");
       }
     })();
 
@@ -2185,16 +1322,10 @@ useEffect(() => {
         candles4hRef.current = data4h;
 
         const prev = getOrInitH4(symbol);
-        const nextChannel = updateLockedChannel(prev.channel, data4h);
-        const nextTrend = updateLockedTrendline(prev.trend, data4h);
-        const nextZones = computeAPlusOBAndAFVG(data4h, nextChannel, nextTrend);
-
-        const next: H4Context = {
-          channel: nextChannel,
-          trend: nextTrend,
-          zones: nextZones,
-          last4hTime: data4h.at(-1)?.time,
-        };
+        const next = computeNextH4Context(
+          prev as any,
+          data4h as any
+        ) as unknown as H4Context;
 
         setH4(symbol, next);
         syncFromStore();
@@ -2249,6 +1380,7 @@ useEffect(() => {
         } else if (last.time === c.time) {
           arr[arr.length - 1] = c;
         }
+        notifyChartControllerUpdated();
         
         syncFromStore();
         updateRightScaleW();
@@ -2323,27 +1455,10 @@ useEffect(() => {
                    
 
           const prev = getOrInitH4(symbol);
-          const nextChannel = updateLockedChannel(prev.channel, arr);
-          const nextTrend = updateLockedTrendline(prev.trend, arr);
-          // ===== DEBUG: reset CTX per compute run =====
-const g: any = window as any;
-g.__CTX = {
-  calls: 0,
-  pass: 0,
-  fail: 0,
-  reasons: {},
-  last: null,
-  ts: Date.now(),
-};
-
-          const nextZones = computeAPlusOBAndAFVG(arr, nextChannel, nextTrend);
-
-          const next: H4Context = {
-            channel: nextChannel,
-            trend: nextTrend,
-            zones: nextZones,
-            last4hTime: c.time,
-          };
+          const next = computeNextH4Context(
+            prev as any,
+            arr as any
+          ) as unknown as H4Context;
 
           setH4(symbol, next);
           syncFromStore();
@@ -2371,6 +1486,14 @@ g.__CTX = {
         cancelAnimationFrame(overlayRafRef.current);
         overlayRafRef.current = null;
       }
+      if (planLinesTimeoutRef.current != null) {
+        window.clearTimeout(planLinesTimeoutRef.current);
+        planLinesTimeoutRef.current = null;
+      }
+      if (highlightedPoiTimeoutRef.current != null) {
+        window.clearTimeout(highlightedPoiTimeoutRef.current);
+        highlightedPoiTimeoutRef.current = null;
+      }
     };
   }, []);
 
@@ -2387,7 +1510,7 @@ g.__CTX = {
 
       {lastPrice != null && (
         <div className="absolute right-3 top-3 rounded bg-zinc-900/70 px-3 py-2 text-sm text-zinc-100">
-          현재가: {lastPrice.toFixed(2)}
+          ?꾩옱媛: {lastPrice.toFixed(2)}
         </div>
       )}
 
@@ -2397,9 +1520,11 @@ g.__CTX = {
           disabled={isLoadingMore}
           className="rounded bg-zinc-900/80 px-3 py-2 text-sm text-zinc-100 hover:bg-zinc-800 disabled:opacity-50"
         >
-          {isLoadingMore ? "불러오는 중..." : "과거 더 불러오기"}
+          {isLoadingMore ? "遺덈윭?ㅻ뒗 以?.." : "怨쇨굅 ??遺덈윭?ㅺ린"}
         </button>
       </div>
     </div>
   );
 }
+
+

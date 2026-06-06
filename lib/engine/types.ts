@@ -28,6 +28,7 @@ export interface Bar {
   high: Price;
   low: Price;
   close: Price;
+  volume: number;
 }
 
 export interface AtrSnapshot {

@@ -28,7 +28,7 @@
     volumes:
       - .:/app
       - web_node_modules:/app/node_modules
-    command: sh -c "npm install && npm run dev -- --webpack --hostname 0.0.0.0"
+    command: sh -c "npm install && npx prisma generate && npm run dev -- --webpack --hostname 0.0.0.0"
 
   worker:
     image: node:20
@@ -44,7 +44,7 @@
     volumes:
       - .:/app
       - worker_node_modules:/app/node_modules
-    command: sh -c "npm install && npm run worker:dev"
+    command: sh -c "npm install && npx prisma generate && npm run worker:dev"
 
 volumes:
   pgdata:

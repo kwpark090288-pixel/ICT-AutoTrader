@@ -1,36 +1,42 @@
 {
-  "name": "trading-web",
-  "version": "0.1.0",
-  "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint",
-    "telegram:smoke": "node scripts/telegram_smoke_test.js",
-    "worker:dev": "tsx worker/main.ts",
-    "engine:exact": "tsx scripts/engine_exact_match.ts"
-  },
-  "dependencies": {
-    "@prisma/client": "^7.4.1",
-    "dotenv": "^17.3.1",
-    "lightweight-charts": "^4.2.2",
-    "next": "16.1.1",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
-    "ws": "^8.19.0"
-  },
-  "devDependencies": {
-    "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "@types/ws": "^8.18.1",
-    "eslint": "^9",
-    "eslint-config-next": "16.1.1",
-    "prisma": "^7.4.1",
-    "tailwindcss": "^4",
-    "tsx": "^4.21.0",
-    "typescript": "^5"
-  }
+    "name":  "trading-web",
+    "version":  "0.1.0",
+    "private":  true,
+    "scripts":  {
+                    "dev":  "next dev",
+                    "build":  "next build",
+                    "start":  "next start",
+                    "lint":  "eslint",
+                    "telegram:smoke":  "node scripts/telegram_smoke_test.js",
+                    "telegram:dispatch":  "tsx scripts/telegram_dispatch_once.ts",
+                    "worker:dev":  "tsx worker/main.ts",
+                    "engine:exact":  "tsx scripts/engine_exact_match.ts",
+                    "smoke:f4":  "tsx scripts/fvg_f4_runtime_smoke.ts",
+                    "trace:f4-open":  "tsx scripts/fvg_f4_send_open_trace.ts",
+                    "funnel:30d":  "tsx scripts/funnel_30d.ts"
+                },
+    "dependencies":  {
+                         "@prisma/adapter-pg":  "^7.5.0",
+                         "@prisma/client":  "^7.4.1",
+                         "dotenv":  "^17.3.1",
+                         "lightweight-charts":  "^4.2.2",
+                         "next":  "16.1.1",
+                         "pg":  "^8.20.0",
+                         "react":  "19.2.3",
+                         "react-dom":  "19.2.3",
+                         "ws":  "^8.19.0"
+                     },
+    "devDependencies":  {
+                            "@tailwindcss/postcss":  "^4",
+                            "@types/node":  "^20",
+                            "@types/react":  "^19",
+                            "@types/react-dom":  "^19",
+                            "@types/ws":  "^8.18.1",
+                            "eslint":  "^9",
+                            "eslint-config-next":  "16.1.1",
+                            "prisma":  "^7.4.1",
+                            "tailwindcss":  "^4",
+                            "tsx":  "^4.21.0",
+                            "typescript":  "^5"
+                        }
 }

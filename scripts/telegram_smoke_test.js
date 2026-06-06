@@ -1,3 +1,5 @@
+require("dotenv/config");
+
 /* telegram_smoke_test.js (one-shot) */
 const enabled = String(process.env.TELEGRAM_ENABLED || "").toLowerCase() === "true";
 const token = process.env.TELEGRAM_BOT_TOKEN;

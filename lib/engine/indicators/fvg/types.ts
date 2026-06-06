@@ -1,4 +1,5 @@
 import type { Bar } from "../../types";
+import type { RouterRawPoi } from "../../../router/raw-event";
 import {
   FVG_ACTIVE_INACTIVE_STATES,
   FVG_BOX_TYPES,
@@ -116,6 +117,8 @@ export interface SetupFvg
   atrAtConf: number;
   parentPoiId: string;
   parentPoiType: ParentPoiType;
+  supportingParentIds?: string[];
+  tags?: string[];
   insideOverlapLen: number;
   insideOverlapRatio: number;
   passInside: boolean;
@@ -186,18 +189,33 @@ export interface SweepRecoveryEvalResult {
   passSweepRecovery: boolean;
 }
 
-export type F4ContextSource = "NONE" | "PROVIDER";
+export type F4ContextSource = "NONE" | "PROVIDER" | "SNAPSHOT";
+
+export type F4ProviderKind = "CHANNEL" | "TRENDLINE";
 
 export interface F4ContextInput {
   symbol: string;
-  tf: FvgTf;
   dir: Dir;
   confTime: Timestamp;
+  candidateId: string;
+  candidateZone: {
+    bottomRaw: number;
+    topRaw: number;
+    heightRaw: number;
+  };
+  atr4hAtConf: number;
+  getPublishedSnapshot?: (
+    tf: "H4" | "D1",
+    atOrBefore: Timestamp
+  ) => readonly RouterRawPoi[];
 }
 
 export interface F4ContextEvalResult {
   source: F4ContextSource;
   passF4: boolean;
+  providerKind?: F4ProviderKind | null;
+  providerId?: string | null;
+  distanceAtr?: number | null;
 }
 
 export interface D1MixedStrongDisplacementEvalResult {
@@ -235,6 +253,45 @@ export interface TouchPenetrationEvalResult {
   overlapLen: number;
   penetrationMin: number;
   passTouchPenetration: boolean;
+}
+
+export interface TickNormalizedZone {
+  bottomTick: number;
+  topTick: number;
+  bottomNorm: number;
+  topNorm: number;
+}
+
+export interface LtfGateEvalResult {
+  poiId: string;
+  poiType: "D1_POI_FVG" | "H4_CORE_FVG" | "SETUP_FVG";
+  tf: "M15" | "M5";
+  dir: Dir;
+  barCloseTime: Timestamp;
+  boundary: Price;
+  priceExtreme: Price;
+  dist: number;
+  atrAtLtf: number;
+  passGate: boolean;
+}
+
+export interface LtfTriggerEvalResult {
+  tf: "M15" | "M5";
+  dir: Dir;
+  barCloseTime: Timestamp;
+  choch: boolean;
+  sweepRec: boolean;
+  microRetestTypes: MicroRetestType[];
+  tokens: ReactionTriggerToken[];
+}
+
+export interface ReactionGateEvalResult {
+  tf: "M15" | "M5";
+  currentCloseTime: Timestamp;
+  blockedAll: boolean;
+  blockedBy5mCooldown: boolean;
+  reactionBlocked: boolean;
+  entryBlocked: boolean;
 }
 
 export interface D1PoiInvalidationFlags extends FvgInvalidationFlags {}

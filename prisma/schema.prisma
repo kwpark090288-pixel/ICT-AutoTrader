@@ -15,6 +15,7 @@ enum TelegramOutboxStatus {
 
 enum TradePlanStatus {
   OPEN
+  CLOSING
   CLOSED
 }
 
@@ -40,18 +41,106 @@ model TelegramOutbox {
 }
 
 model TradePlan {
-  planId    String          @id @default(uuid()) @map("plan_id")
-  status    TradePlanStatus @default(OPEN)
-  symbol    String
-  tf        String?
-  direction String?
-  openedAt  DateTime        @default(now()) @map("opened_at")
-  closedAt  DateTime?       @map("closed_at")
-  createdAt DateTime        @default(now()) @map("created_at")
-  updatedAt DateTime        @updatedAt @map("updated_at")
+  planId          String          @id @default(uuid()) @map("plan_id")
+  planKey         String          @unique @map("plan_key")
+  tradeKey        String          @map("trade_key")
+  zoneKey         String          @map("zone_key")
+  status          TradePlanStatus @default(OPEN)
+  symbol          String
+  tf              String?
+  direction       String?
+  source          String?
+  poiTier         String?         @map("poi_tier")
+  poiId           String?         @map("poi_id")
+  eventType       String?         @map("event_type")
+  riskPctAtOpen   Float?          @map("risk_pct_at_open")
+  edgeSigFine     String?         @map("edge_sig_fine")
+  edgeSigMid      String?         @map("edge_sig_mid")
+  edgeSigCoarse   String?         @map("edge_sig_coarse")
+  rAfterCost      Float?          @map("r_after_cost")
+  poiClusterKey   String?         @map("poi_cluster_key")
+  poiHighlightJson Json?          @map("poi_highlight_json")
+  planJson        Json?           @map("plan_json")
+  openedAt        DateTime        @default(now()) @map("opened_at")
+  closedAt        DateTime?       @map("closed_at")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
 
   @@index([symbol, status, openedAt])
+  @@index([tradeKey, status])
+  @@index([status, openedAt])
+  @@index([status, closedAt])
   @@map("trade_plans")
+}
+
+model EdgeStat {
+  signatureType String   @map("signature_type")
+  signatureKey  String   @map("signature_key")
+  n             Int      @default(0)
+  meanR         Float    @default(0) @map("mean_r")
+  stdR          Float    @default(0) @map("std_r")
+  m2            Float    @default(0)
+  updatedAtUtc  DateTime @map("updated_at_utc")
+
+  @@id([signatureType, signatureKey])
+  @@index([signatureType, updatedAtUtc])
+  @@map("edge_stats")
+}
+
+model ConcentrationHistory {
+  id           String   @id @default(uuid())
+  candidateId  String   @map("candidate_id")
+  tradeKey     String   @map("trade_key")
+  symbol       String
+  dir          String
+  clusterKey   String   @map("cluster_key")
+  source       String
+  poiTier      String   @map("poi_tier")
+  openTimeUtc  DateTime @map("open_time_utc")
+  createdAtUtc DateTime @default(now()) @map("created_at_utc")
+
+  @@unique([tradeKey, openTimeUtc, clusterKey])
+  @@index([symbol, dir, openTimeUtc])
+  @@index([clusterKey, openTimeUtc])
+  @@map("concentration_history")
+}
+
+model PolicyAccountState {
+  profileId            String   @map("profile_id")
+  scope                String
+  riskMode             String   @map("risk_mode")
+  updatedAtUtc         DateTime @map("updated_at_utc")
+  lastTransitionReason String?  @map("last_transition_reason")
+
+  @@id([profileId, scope])
+  @@map("policy_account_state")
+}
+
+model PolicyDecisionLog {
+  candidateId        String   @id @map("candidate_id")
+  tradeKey           String   @map("trade_key")
+  symbol             String
+  dir                String
+  clusterKey         String?  @map("cluster_key")
+  source             String
+  poiTier            String   @map("poi_tier")
+  eventType          String   @map("event_type")
+  decision           String
+  scoreDeltaSum      Float    @default(0) @map("score_delta_sum")
+  policyTagsJson     Json?    @map("policy_tags_json")
+  reasonsJson        Json?    @map("reasons_json")
+  evidenceLevel      String?  @map("evidence_level")
+  usedSignature      String?  @map("used_signature")
+  riskMode           String   @map("risk_mode")
+  suggestedRiskPct   Float    @default(0) @map("suggested_risk_pct")
+  openTimeUtc        DateTime @map("open_time_utc")
+  createdAtUtc       DateTime @default(now()) @map("created_at_utc")
+  updatedAtUtc       DateTime @updatedAt @map("updated_at_utc")
+
+  @@index([openTimeUtc, source, decision])
+  @@index([symbol, dir, openTimeUtc])
+  @@index([tradeKey, openTimeUtc])
+  @@map("policy_decision_log")
 }
 
 model SignalEvent {
@@ -109,4 +198,23 @@ model ReviewNote {
 
   @@index([planId, createdAt])
   @@map("review_notes")
+}
+
+model SoundPreference {
+  id           String   @id @default(uuid())
+  profileId    String   @unique @map("profile_id")
+  enabled      Boolean  @default(false)
+  updatedAtUtc DateTime @map("updated_at_utc")
+
+  @@map("sound_preferences")
+}
+
+model SoundPlayed {
+  id          String   @id @default(uuid())
+  profileId   String   @map("profile_id")
+  eventId     String   @map("event_id")
+  playedAtUtc DateTime @map("played_at_utc")
+
+  @@unique([profileId, eventId])
+  @@map("sound_played")
 }

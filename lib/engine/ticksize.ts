@@ -16,6 +16,15 @@ export function getCachedTickSize(symbol: string): number | undefined {
   return tickSizeCache.get(symbol.toUpperCase());
 }
 
+export function setCachedTickSize(symbol: string, tickSize: number): void {
+  const key = symbol.toUpperCase();
+  if (!Number.isFinite(tickSize) || tickSize <= 0) {
+    tickSizeCache.delete(key);
+    return;
+  }
+  tickSizeCache.set(key, tickSize);
+}
+
 export function getCachedTickSizeOrThrow(symbol: string): number {
   const value = getCachedTickSize(symbol);
   if (!Number.isFinite(value)) {

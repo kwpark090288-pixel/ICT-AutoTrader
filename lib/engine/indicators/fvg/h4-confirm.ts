@@ -19,6 +19,19 @@ type EvaluateH4CoreFvgCandidateConfirmArgs = {
   passF4: boolean;
 };
 
+function latchH4CoreConfirmFlags(
+  candidate: H4CoreFvg,
+  passF2: boolean,
+  passF3: boolean,
+  passF4: boolean
+) {
+  return {
+    passF2: candidate.passF2 || passF2,
+    passF3: candidate.passF3 || passF3,
+    passF4: candidate.passF4 || passF4,
+  };
+}
+
 export function evaluateH4CoreFvgCandidateConfirm(
   args: EvaluateH4CoreFvgCandidateConfirmArgs
 ): H4CandidateConfirmEvalResult {
@@ -48,28 +61,40 @@ export function applyH4CoreFvgCandidateConfirm(
     return candidate;
   }
 
+  const latched = latchH4CoreConfirmFlags(candidate, passF2, passF3, passF4);
+
   if (currentCloseTime !== candidate.confirmDueTime) {
-    return candidate;
+    if (
+      latched.passF2 === candidate.passF2 &&
+      latched.passF3 === candidate.passF3 &&
+      latched.passF4 === candidate.passF4
+    ) {
+      return candidate;
+    }
+
+    return {
+      ...candidate,
+      ...latched,
+    };
   }
 
-  const evaluation = evaluateH4CoreFvgCandidateConfirm(args);
+  const evaluation = evaluateH4CoreFvgCandidateConfirm({
+    ...args,
+    ...latched,
+  });
 
   if (evaluation.passConfirm) {
     return {
       ...candidate,
       state: "A_ACTIVE",
-      passF2,
-      passF3,
-      passF4,
+      ...latched,
     };
   }
 
   return {
     ...candidate,
     state: "DELETED",
-    passF2,
-    passF3,
-    passF4,
+    ...latched,
     invalidReason: "failed_confirm",
     endTime: currentCloseTime,
   };

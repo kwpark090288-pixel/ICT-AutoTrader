@@ -15,6 +15,9 @@ type CreateH4CoreFvgCandidateArgs = {
   symbol: string;
   detectedFvg: DetectedWickFvg | null;
   displacementEval?: DisplacementEvalResult | null;
+  initialPassF2?: boolean;
+  initialPassF3?: boolean;
+  initialPassF4?: boolean;
 };
 
 export function getH4CoreConfirmDueTime(confTime: number): number {
@@ -28,7 +31,15 @@ export function getH4CoreDisplayUntil(confTime: number): number {
 export function createH4CoreFvgCandidate(
   args: CreateH4CoreFvgCandidateArgs
 ): H4CoreFvg | null {
-  const { id, symbol, detectedFvg, displacementEval } = args;
+  const {
+    id,
+    symbol,
+    detectedFvg,
+    displacementEval,
+    initialPassF2 = false,
+    initialPassF3 = false,
+    initialPassF4 = false,
+  } = args;
 
   if (!detectedFvg) return null;
   if (detectedFvg.tf !== "H4") return null;
@@ -60,8 +71,8 @@ export function createH4CoreFvgCandidate(
     atrAtConf: detectedFvg.atrAtConf,
     confirmDueTime: getH4CoreConfirmDueTime(detectedFvg.confTime),
     passF1,
-    passF2: false,
-    passF3: false,
-    passF4: false,
+    passF2: initialPassF2,
+    passF3: initialPassF3,
+    passF4: initialPassF4,
   };
 }

@@ -77,8 +77,13 @@ export const H4_F2_F3_RANGE_BARS = 3;
 export const TICK_EPSILON_FACTOR = 1e-6;
 export const STACK_RATIO_DISPLAY_DECIMALS = 2;
 
+export const LTF_MICRO_PIVOT_LEN = 2;
+export const LTF_SWEEP_RECOVERY_MAX_BARS = 2;
+export const MICRO_OB_LOOKBACK_BARS = 6;
+
 export const COOLDOWN_AFTER_15M_REACTION_MIN = 30;
 export const COOLDOWN_AFTER_5M_ENTRY_MIN = 60;
+export const MAX_TOUCH_VALID = 2;
 
 export const MAX_ACTIVE_D1 = 3;
 export const MAX_ACTIVE_H4_POOL = 10;

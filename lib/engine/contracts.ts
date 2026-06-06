@@ -11,4 +11,7 @@ export type EngineEventBatch = EngineEvent[];
 
 export type IndicatorEngine = {
   onBarClose(bar: Bar): EngineEventBatch;
+  onBarClosePhaseA?(bar: Bar): EngineEventBatch;
+  onBarClosePhaseC?(bar: Bar): EngineEventBatch;
+  publishRuntimeSnapshot?(): void;
 };
